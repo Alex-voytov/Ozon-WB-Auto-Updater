@@ -1,0 +1,22 @@
+# Секреты и локальные настройки — никогда не публикуются
+config.json
+
+# Логи
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE / инструменты
+.claude/
+.vscode/
+.idea/
+
+# ОС
+.DS_Store
+Thumbs.db
