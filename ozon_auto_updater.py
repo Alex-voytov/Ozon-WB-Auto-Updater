@@ -2028,7 +2028,7 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
             tag = tag.strip("_")
             if not tag or len(tag) < 2:
                 return ""
-            return "#" + tag[:30]
+            return ("#" + tag)[:30]
 
         seen_tags: set = set()
         formatted_hashtags = []
