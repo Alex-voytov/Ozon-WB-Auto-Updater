@@ -738,8 +738,8 @@ class WbClient:
             "subjectID": subject_id,
             "variants": [{
                 "vendorCode": vendor_code,
-                "title": name[:100],
-                "description": description[:5000],
+                "title": name[:60],
+                "description": description[:2000],
                 "brand": "",
                 "dimensions": {"length": 0, "width": 0, "height": 0, "weightBrutto": 0},
                 "characteristics": [],
@@ -1565,6 +1565,42 @@ def _sanitize_wb_description(text: str) -> str:
     return text.strip()
 
 
+# WB: название карточки — жёсткий лимит 60 символов (документация WB API).
+# Описание: реальный лимит зависит от категории (1000–5000 символов, чаще всего 2000) —
+# точный лимит категории через API недоступен, поэтому используем консервативный
+# безопасный потолок, подходящий для подавляющего большинства категорий.
+WB_TITLE_MAX = 60
+WB_DESCRIPTION_SAFE_MAX = 2000
+
+
+def _enforce_wb_title(title: str, fallback: str = "") -> str:
+    """Приводит название к требованиям WB: без markdown/эмодзи, не длиннее WB_TITLE_MAX,
+    обрезка по границе слова, чтобы не рвать слово посередине."""
+    def _clean_and_cut(raw: str) -> str:
+        cleaned = re.sub(r'[*_`#>~]', '', (raw or "").strip())
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if len(cleaned) > WB_TITLE_MAX:
+            cut = cleaned[:WB_TITLE_MAX]
+            if ' ' in cut:
+                cut = cut.rsplit(' ', 1)[0]
+            cleaned = cut.strip()
+        return cleaned
+
+    result = _clean_and_cut(title)
+    return result or _clean_and_cut(fallback)
+
+
+def _enforce_wb_description(description: str, max_len: int = WB_DESCRIPTION_SAFE_MAX) -> str:
+    """Обрезает описание по безопасному лимиту символов WB, по границе слова."""
+    description = (description or "").strip()
+    if len(description) > max_len:
+        cut = description[:max_len]
+        if ' ' in cut:
+            cut = cut.rsplit(' ', 1)[0]
+        description = cut.strip()
+    return description
+
+
 class WbDescriptionGenerator:
     """Генератор описаний для Wildberries на основе шаблонов."""
 
@@ -1620,10 +1656,17 @@ class WbDescriptionGenerator:
                 + "."
             )
         result = "\n\n".join(paragraphs)
-        # WB: макс 5000 символов
-        if len(result) > 5000:
-            result = result[:4997] + "..."
-        return _sanitize_wb_description(result)
+        result = _sanitize_wb_description(result)
+        return _enforce_wb_description(result)
+
+    def generate_wb_content(self, product_name: str, keywords: List[str],
+                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+        """Возвращает {"title", "description"} для карточки WB.
+        Название здесь не переписывается творчески (шаблонный генератор без AI) —
+        только нормализуется под требования WB (без markdown, не длиннее WB_TITLE_MAX)."""
+        description = self.generate_description(product_name, keywords)
+        title = _enforce_wb_title(product_name, fallback=product_name)
+        return {"title": title, "description": description}
 
 
 # ============================================================================
@@ -1721,6 +1764,96 @@ class DescriptionGenerator:
             if "credit balance is too low" in msg or "insufficient_quota" in msg:
                 raise AIGenerationError(f"CREDITS_EXHAUSTED:{exc}")
             raise AIGenerationError(f"Ошибка Claude API: {exc}")
+        except Exception as exc:
+            raise AIGenerationError(f"Ошибка генерации: {exc}")
+
+    def generate_wb_content(self, product_name: str, keywords: List[str],
+                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+        """Генерирует название и описание карточки WB одним запросом (JSON-ответ),
+        с учётом требований Wildberries: название ≤60 символов, описание без
+        доставки/цен/контактов/упоминаний других площадок."""
+        keywords_str = ", ".join(keywords[:10]) if keywords else "не указаны"
+        comp_block = ""
+        if competitors:
+            lines = []
+            for i, c in enumerate(competitors[:3], 1):
+                lines.append(f"Конкурент {i} — {c.get('name','')[:80]}:\n{c.get('description','')[:900]}")
+            comp_block = (
+                "\n\nАНАЛИЗ КОНКУРЕНТОВ (топ по запросу):\n"
+                "Изучи структуру и содержание этих описаний. Используй похожий подход — "
+                "те же смысловые акценты, структуру абзацев, упомянутые свойства. "
+                "Но напиши СВОЁ уникальное описание, не копируй текст:\n\n"
+                + "\n\n".join(lines)
+            )
+        prompt = f"""Ты — профессиональный копирайтер для маркетплейса Wildberries. Составь название и SEO-описание карточки товара.
+
+Текущее название товара: {product_name}
+Ключевые слова для включения: {keywords_str}
+{comp_block}
+
+ТРЕБОВАНИЯ К НАЗВАНИЮ:
+- Не длиннее {WB_TITLE_MAX} символов (оптимально 40–60) — WB обрезает более длинные названия
+- Схема: тип товара + ключевая характеристика + назначение/объём/количество, без воды
+- Без маркетинговых эпитетов ("лучший", "премиум", "топ"), без обещаний, без повторов и синонимов одного и того же слова
+- Только кириллица и/или латиница, без эмодзи и спецсимволов кроме обычной пунктуации
+- Сохрани узнаваемость товара (бренд, ключевая характеристика), но убери дублирующиеся слова, если они есть в исходном названии
+
+ТРЕБОВАНИЯ К ОПИСАНИЮ:
+- Длина: 900–1800 символов
+- Структура: 3–5 абзацев
+- Вставляй ключевые слова только там, где они естественно вписываются по смыслу — не перечисляй их подряд списком и не вставляй слово ради самого факта его наличия
+- Если ключевое слово — словосочетание из нескольких слов, НЕ вставляй его целиком как готовый оборот и НЕ используй как подлежащее; разбей на смысловые части и согласуй по роду, числу и падежу с остальным текстом
+- Не смешивай кириллицу и латиницу внутри одного словосочетания
+- Текст должен читаться как связное, осмысленное описание живым русским языком
+- На русском языке, грамотно; перед выводом проверь орфографию, пунктуацию и логическую согласованность
+- СТРОГО ЗАПРЕЩЕНО (штраф и блокировка карточки):
+  * инструкции по применению: дозировки, схемы приёма
+  * доставка, возврат, обмен товара
+  * цены, скидки, акции, кэшбэк, промокоды
+  * призывы купить: "оформите заказ", "купите сейчас", "успейте"
+  * контакты: телефоны, email, ссылки, соцсети, домены сайтов (.ru, .com и т.п.)
+  * упоминание других маркетплейсов (Ozon, AliExpress и др.) и самого Wildberries
+  * хэштеги и SEO-теги внутри текста описания
+  * символы ® © ™
+  * слова "реплика", "аналог", "копия", "оригинал"
+
+Верни СТРОГО JSON без пояснений до или после, в формате:
+{{"title": "новое название", "description": "текст описания"}}"""
+
+        _THINKING_MODELS = ("claude-opus-4", "claude-sonnet-4", "claude-fable")
+        use_thinking = any(self.model.startswith(m) for m in _THINKING_MODELS)
+
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 2000,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if use_thinking:
+            kwargs["thinking"] = {"type": "adaptive"}
+
+        try:
+            response = self.client.messages.create(**kwargs)
+            text = "".join(block.text for block in response.content if block.type == "text")
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if not match:
+                raise AIGenerationError("Claude не вернул JSON с названием и описанием")
+            data = json.loads(match.group(0))
+            title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name)
+            description = _sanitize_wb_description(str(data.get("description", "")))
+            description = _enforce_wb_description(description)
+            if not description:
+                raise AIGenerationError("Claude вернул пустое описание")
+            return {"title": title, "description": description}
+
+        except anthropic.BadRequestError as exc:
+            raise AIGenerationError(f"Неверный запрос к Claude API (400): {exc}")
+        except anthropic.APIError as exc:
+            msg = str(exc)
+            if "credit balance is too low" in msg or "insufficient_quota" in msg:
+                raise AIGenerationError(f"CREDITS_EXHAUSTED:{exc}")
+            raise AIGenerationError(f"Ошибка Claude API: {exc}")
+        except AIGenerationError:
+            raise
         except Exception as exc:
             raise AIGenerationError(f"Ошибка генерации: {exc}")
 
@@ -1827,6 +1960,11 @@ class GeminiDescriptionGenerator:
         self._wb_mode = False
 
     def _call(self, prompt: str) -> str:
+        return _sanitize_description(self._call_raw(prompt))[:6000]
+
+    def _call_raw(self, prompt: str) -> str:
+        """Как _call, но без санитайзинга/обрезки — нужно для JSON-ответов
+        (generate_wb_content), где нельзя портить структуру JSON."""
         _RATE_LIMIT_PAUSE = 65   # секунд ожидания при 429
         _UNAVAIL_PAUSE   = 45   # секунд ожидания при 503
         _MAX_ATTEMPTS    = 5    # попыток всего
@@ -1840,7 +1978,7 @@ class GeminiDescriptionGenerator:
                 text = (response.text or "").strip()
                 if not text:
                     raise AIGenerationError("Gemini вернул пустой ответ")
-                return _sanitize_description(text)[:6000]
+                return text
             except AIGenerationError:
                 raise
             except Exception as exc:
@@ -1884,6 +2022,68 @@ class GeminiDescriptionGenerator:
                 f"Но напиши СВОЁ уникальное описание, не копируй текст:\n\n{comp_block}"
             )
         return self._call(prompt)
+
+    _WB_JSON_PROMPT = """Ты — профессиональный копирайтер для маркетплейса Wildberries. Составь название и описание карточки товара.
+
+Текущее название товара: {product_name}
+Ключевые поисковые запросы (вплети большинство в текст описания органично):
+{keywords_str}
+
+ТРЕБОВАНИЯ К НАЗВАНИЮ:
+- Не длиннее 60 символов (оптимально 40–60) — WB обрезает более длинные названия
+- Схема: тип товара + ключевая характеристика + назначение/объём/количество, без воды
+- Без маркетинговых эпитетов ("лучший", "премиум"), без повторов и синонимов одного и того же слова
+- Только кириллица и/или латиница, без эмодзи и спецсимволов кроме обычной пунктуации
+
+ТРЕБОВАНИЯ К ОПИСАНИЮ (700–1600 символов, живой человеческий язык, не шаблонный копирайтинг):
+1. Суть товара и его главная польза
+2. Состав, характеристики, особенности
+3. Кому подходит и какой результат даёт — без инструкций по применению
+Ключевые слова вставляй органично, только там, где это естественно по смыслу; не форсируй и не перечисляй списком.
+
+ФОРМАТ ОПИСАНИЯ: чистый текст без markdown (**, *, #, _), абзацы через пустую строку, без списков с дефисами.
+
+ЗАПРЕЩЕНО (и в названии, и в описании):
+- Инструкции по применению: дозировки, схемы приёма
+- Доставка, возврат, скидки, цены, промокоды
+- Контакты, ссылки, домены сайтов (.ru, .com и т.п.)
+- Другие маркетплейсы (Ozon, AliExpress) и упоминание самого Wildberries
+- Символы ® © ™; слова "реплика", "аналог", "копия"
+
+Верни СТРОГО JSON без пояснений до или после, в формате:
+{{"title": "новое название", "description": "текст описания"}}"""
+
+    def generate_wb_content(self, product_name: str, keywords: List[str],
+                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+        """Генерирует название и описание карточки WB одним запросом (JSON-ответ)."""
+        kws = keywords[:25] if keywords else []
+        keywords_str = "\n".join(f"- {kw}" for kw in kws) if kws else "- (не указаны)"
+        prompt = self._WB_JSON_PROMPT.format(product_name=product_name, keywords_str=keywords_str)
+        if competitors:
+            comp_lines = []
+            for i, c in enumerate(competitors[:3], 1):
+                comp_lines.append(f"Конкурент {i} — {c.get('name', '')[:80]}:\n{c.get('description', '')[:900]}")
+            comp_block = "\n\n".join(comp_lines)
+            prompt += (
+                f"\n\nАНАЛИЗ КОНКУРЕНТОВ (топ по запросу):\n"
+                f"Изучи структуру и содержание этих описаний. Используй похожий подход — "
+                f"те же смысловые акценты, структуру абзацев, упомянутые свойства. "
+                f"Но напиши СВОЁ уникальное описание, не копируй текст:\n\n{comp_block}"
+            )
+        text = self._call_raw(prompt)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if not match:
+            raise AIGenerationError("Gemini не вернул JSON с названием и описанием")
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise AIGenerationError(f"Gemini вернул повреждённый JSON: {exc}")
+        title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name)
+        description = _sanitize_wb_description(str(data.get("description", "")))
+        description = _enforce_wb_description(description)
+        if not description:
+            raise AIGenerationError("Gemini вернул пустое описание")
+        return {"title": title, "description": description}
 
     def for_wb(self) -> "GeminiDescriptionGenerator":
         """Возвращает копию генератора настроенную на WB-промпт."""
@@ -2152,18 +2352,18 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
             gen_name = "Gemini"
         else:
             gen_name = "Claude"
-        log(f"  Генерируем описание по {gen_name}...")
+        log(f"  Генерируем название и описание по {gen_name}...")
 
         try:
-            new_description = generator.generate_description(product_name, keywords,
-                                                             competitors=competitors or None)
+            content = generator.generate_wb_content(product_name, keywords,
+                                                    competitors=competitors or None)
         except AIGenerationError as exc:
             emsg = str(exc)
             if emsg.startswith("CREDITS_EXHAUSTED:"):
                 log(f"  Лимит AI исчерпан ({emsg[18:60]}) — переключаемся на шаблонный генератор WB")
                 fallback = WbDescriptionGenerator()
                 try:
-                    new_description = fallback.generate_description(product_name, keywords)
+                    content = fallback.generate_wb_content(product_name, keywords)
                 except Exception as exc2:
                     log(f"  ОШИБКА шаблонного генератора: {exc2}")
                     return "error"
@@ -2174,12 +2374,23 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
                 log(f"  ОШИБКА генерации: {exc}")
                 return "error"
 
-        log(f"  Описание сгенерировано ({len(new_description)} симв.)")
+        # Дополнительная проверка на соответствие требованиям WB — на случай, если
+        # генератор всё же вернул что-то, выходящее за лимиты (защита от регрессий)
+        new_title = _enforce_wb_title(content.get("title", ""), fallback=product_name)
+        new_description = _enforce_wb_description(_sanitize_wb_description(content.get("description", "")))
+        if not new_description:
+            log("  ОШИБКА: пустое описание после проверки требований WB")
+            return "error"
 
+        log(f"  Название сгенерировано ({len(new_title)}/{WB_TITLE_MAX} симв.), "
+            f"описание сгенерировано ({len(new_description)} симв.)")
+
+        old_title = str(card.get("title") or "")
         old_description = wb.get_current_description(card)
 
         if confirm_fn is not None:
-            decision = confirm_fn(str(vendor_code), product_name, old_description, new_description)
+            decision = confirm_fn(str(vendor_code), product_name, old_description, new_description,
+                                  old_title=old_title, new_title=new_title)
             if decision in ("skip", "skip_all"):
                 log("  Пропущено пользователем")
                 return decision
@@ -2188,11 +2399,12 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
         else:
             decision = "apply"
 
-        # Обновляем только поле description — всё остальное сохраняем
+        # Обновляем название и описание — остальные поля карточки сохраняем как есть
         updated_card = dict(card)
+        updated_card["title"] = new_title
         updated_card["description"] = new_description
         wb.update_card(updated_card)
-        log(f"  [OK] Описание обновлено")
+        log(f"  [OK] Название и описание обновлены")
         return decision if decision == "apply_all" else "ok"
 
     except WbApiError as exc:
@@ -3185,10 +3397,11 @@ class PreviewDialog(tk.Toplevel):
     """Модальный диалог для сравнения старого и нового описания."""
 
     def __init__(self, parent, offer_id: str, product_name: str,
-                 old_description: str, new_description: str):
+                 old_description: str, new_description: str,
+                 old_title: Optional[str] = None, new_title: Optional[str] = None):
         super().__init__(parent)
         self.title(f"Предпросмотр — {offer_id}")
-        self.geometry("1000x620")
+        self.geometry("1000x680" if new_title is not None else "1000x620")
         self.resizable(True, True)
         self.grab_set()  # модальный
 
@@ -3201,6 +3414,19 @@ class PreviewDialog(tk.Toplevel):
         ttk.Label(self, text=f"offer_id: {offer_id}", foreground="gray").pack(
             padx=12, anchor="w"
         )
+
+        # Сравнение названия (только если генератор менял и название, например для WB)
+        if new_title is not None:
+            title_frame = ttk.LabelFrame(self, text="  Название  ")
+            title_frame.pack(fill="x", padx=12, pady=(8, 0))
+            title_old_len = len(old_title or "")
+            title_new_len = len(new_title)
+            ttk.Label(title_frame, text=f"Было ({title_old_len}): {old_title or '(не задано)'}",
+                     foreground="#ff9999", wraplength=940, justify="left").pack(
+                anchor="w", padx=8, pady=(4, 2))
+            ttk.Label(title_frame, text=f"Стало ({title_new_len}/{WB_TITLE_MAX}): {new_title}",
+                     foreground="#99ff99", wraplength=940, justify="left").pack(
+                anchor="w", padx=8, pady=(0, 4))
 
         # Панель сравнения
         panes = ttk.PanedWindow(self, orient="horizontal")
@@ -4229,11 +4455,12 @@ class App(tk.Tk):
                 f.write(self.log_text.get("1.0", "end"))
 
     def _make_confirm_fn(self):
-        def confirm(offer_id, product_name, old_desc, new_desc):
+        def confirm(offer_id, product_name, old_desc, new_desc, old_title=None, new_title=None):
             result_holder = [None]
             done_event = threading.Event()
             def show_dialog():
-                dlg = PreviewDialog(self, offer_id, product_name, old_desc, new_desc)
+                dlg = PreviewDialog(self, offer_id, product_name, old_desc, new_desc,
+                                    old_title=old_title, new_title=new_title)
                 result_holder[0] = dlg.result or "skip"
                 done_event.set()
             self.after(0, show_dialog)
