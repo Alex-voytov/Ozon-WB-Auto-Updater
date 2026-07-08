@@ -3051,7 +3051,7 @@ class ProductSelectorDialog(tk.Toplevel):
         for w in self._inner.winfo_children():
             w.destroy()
         for item_id, name in self._all_items:
-            if q in item_id.lower() or q in name.lower():
+            if q in str(item_id).lower() or q in str(name).lower():
                 var = self._vars[item_id]
                 ttk.Checkbutton(self._inner, text=f"{item_id}  —  {name[:80]}", variable=var).pack(
                     anchor="w", padx=6, pady=1)
@@ -3061,14 +3061,14 @@ class ProductSelectorDialog(tk.Toplevel):
     def _select_all(self):
         q = self._search_var.get().lower()
         for item_id, name in self._all_items:
-            if not q or q in item_id.lower() or q in name.lower():
+            if not q or q in str(item_id).lower() or q in str(name).lower():
                 self._vars[item_id].set(True)
         self._update_count()
 
     def _deselect_all(self):
         q = self._search_var.get().lower()
         for item_id, name in self._all_items:
-            if not q or q in item_id.lower() or q in name.lower():
+            if not q or q in str(item_id).lower() or q in str(name).lower():
                 self._vars[item_id].set(False)
         self._update_count()
 
