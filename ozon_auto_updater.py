@@ -3421,12 +3421,12 @@ class PreviewDialog(tk.Toplevel):
             title_frame.pack(fill="x", padx=12, pady=(8, 0))
             title_old_len = len(old_title or "")
             title_new_len = len(new_title)
-            ttk.Label(title_frame, text=f"Было ({title_old_len}): {old_title or '(не задано)'}",
-                     foreground="#ff9999", wraplength=940, justify="left").pack(
-                anchor="w", padx=8, pady=(4, 2))
-            ttk.Label(title_frame, text=f"Стало ({title_new_len}/{WB_TITLE_MAX}): {new_title}",
-                     foreground="#99ff99", wraplength=940, justify="left").pack(
-                anchor="w", padx=8, pady=(0, 4))
+            tk.Label(title_frame, text=f"Было ({title_old_len}): {old_title or '(не задано)'}",
+                    bg="#2d2d2d", fg="#ff9999", wraplength=940, justify="left", anchor="w").pack(
+                fill="x", padx=4, pady=(4, 2))
+            tk.Label(title_frame, text=f"Стало ({title_new_len}/{WB_TITLE_MAX}): {new_title}",
+                    bg="#1e2d1e", fg="#99ff99", wraplength=940, justify="left", anchor="w").pack(
+                fill="x", padx=4, pady=(0, 4))
 
         # Панель сравнения
         panes = ttk.PanedWindow(self, orient="horizontal")
