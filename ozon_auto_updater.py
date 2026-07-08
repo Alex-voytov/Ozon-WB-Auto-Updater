@@ -1706,10 +1706,23 @@ class OzonPerformanceClient:
             return str(exc)
 
 
-# Кампании с автостратегией (например TARGET_BIDS) игнорируют вручную заданную
-# ставку — Ozon сам подбирает её. Авторегулировку можно применять только к
-# кампаниям без автостратегии.
-OZON_ADS_MANUAL_STRATEGY = "NO_AUTO_STRATEGY"
+def _ozon_campaign_bid_editable(campaign: Dict[str, Any]) -> bool:
+    """True, если для кампании можно вручную задавать ставку через PUT .../products.
+
+    ВАЖНО: поле productAutopilotStrategy — это не флаг "автопилот включён/выключен",
+    а тип стратегии, назначенный по умолчанию для данного вида кампании (TARGET_BIDS
+    для обычных CPC/SKU-кампаний, NO_AUTO_STRATEGY для баннеров и для кампаний
+    "Оплата за заказ" — там просто нет этого понятия). Реальный признак включённого
+    автопилота — непустое поле "autopilot"; на практике оно None даже у кампаний с
+    productAutopilotStrategy=TARGET_BIDS, если автопилот не включён вручную в кабинете.
+
+    Также годятся только классические товарные CPC-кампании (advObjectType=SKU,
+    PaymentType=CPC) — эндпоинт PUT .../products относится именно к ним; у баннерных
+    (CPM) и "Оплата за заказ" (CPO/SEARCH_PROMO) кампаний ставка настраивается иначе,
+    и метод её установки для CPO-кампаний Ozon вообще пометил устаревшим."""
+    if campaign.get("PaymentType") != "CPC" or campaign.get("advObjectType") != "SKU":
+        return False
+    return not campaign.get("autopilot")
 
 
 def run_ozon_ads_cycle(perf: OzonPerformanceClient, products_cfg: Dict[str, Dict[str, Any]],
@@ -3986,16 +3999,18 @@ class OzonAdsProductSettingsDialog(tk.Toplevel):
         self.grab_set()
 
         self.result: Optional[Dict[str, Any]] = None
-        is_manual = campaign.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+        is_manual = _ozon_campaign_bid_editable(campaign)
 
         bid_line = f"{competitive_bid:.2f}₽" if competitive_bid is not None else "нет данных"
         info = f"Кампания: {campaign.get('title', '')}\nSKU: {sku}\nКонкурентная ставка: {bid_line}"
         ttk.Label(self, text=info, wraplength=380, justify="left").pack(padx=14, pady=(14, 8), anchor="w")
 
         if not is_manual:
-            warn = ttk.Label(self, text="У этой кампании включена автостратегия Ozon "
-                                        "(TARGET_BIDS и т.п.) — вручную заданная ставка "
-                                        "игнорируется. Авторегулировка недоступна.",
+            reason = ("включён автопилот Ozon — вручную заданная ставка игнорируется"
+                     if campaign.get("autopilot")
+                     else "это не обычная товарная CPC-кампания (баннер или «Оплата за заказ») — "
+                          "ставка для неё настраивается иначе")
+            warn = ttk.Label(self, text=f"Авторегулировка недоступна: {reason}.",
                              foreground="#cc6600", wraplength=380, justify="left")
             warn.pack(padx=14, pady=(0, 8), anchor="w")
 
@@ -4732,8 +4747,9 @@ class App(tk.Tk):
                  font=("", 10, "bold")).pack(padx=16, pady=(12, 2), anchor="w")
         hint = ("Каждые 5 минут скрипт сравнивает вашу ставку с конкурентной ставкой по "
                 "товару (Ozon Performance API) и держит вашу ставку выше на заданный процент. "
-                "Работает только для кампаний БЕЗ автостратегии Ozon (TARGET_BIDS и т.п.) — "
-                "для остальных ставку определяет сам Ozon, и ручное значение игнорируется.\n"
+                "Работает только для обычных товарных CPC-кампаний с выключенным автопилотом "
+                "Ozon — для баннерных, «Оплата за заказ» и кампаний с включённым автопилотом "
+                "ручная ставка недоступна или игнорируется.\n"
                 "Дважды кликните по товару, чтобы задать наценку и включить авторегулировку.")
         ttk.Label(parent, text=hint, foreground="gray", wraplength=1000, justify="left").pack(padx=16, anchor="w")
 
@@ -4816,7 +4832,7 @@ class App(tk.Tk):
                 continue
             if not skus:
                 continue
-            is_manual = camp.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+            is_manual = _ozon_campaign_bid_editable(camp)
             competitive: Dict[str, float] = {}
             if is_manual:
                 # Конкурентные ставки запрашиваем только там, где авторегулировка вообще
@@ -4840,7 +4856,7 @@ class App(tk.Tk):
                 camp_id = str(camp.get("id"))
                 sku = r["sku"]
                 key = f"{camp_id}:{sku}"
-                is_manual = camp.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+                is_manual = _ozon_campaign_bid_editable(camp)
                 cfg = products_cfg.get(key, {})
                 enabled = bool(cfg.get("enabled")) and is_manual
                 margin = cfg.get("margin_pct")
