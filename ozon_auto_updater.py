@@ -1768,13 +1768,15 @@ class DescriptionGenerator:
 
             return description
 
-        except anthropic.BadRequestError as exc:
-            # 400 — невалидный запрос, повторять бессмысленно
-            raise AIGenerationError(f"Неверный запрос к Claude API (400): {exc}")
         except anthropic.APIError as exc:
+            # Anthropic возвращает нехватку кредитов как 400 invalid_request_error,
+            # поэтому проверяем текст ошибки ДО различения по типу/статус-коду —
+            # иначе BadRequestError маскирует реальную причину (кончились кредиты)
             msg = str(exc)
             if "credit balance is too low" in msg or "insufficient_quota" in msg:
                 raise AIGenerationError(f"CREDITS_EXHAUSTED:{exc}")
+            if isinstance(exc, anthropic.BadRequestError):
+                raise AIGenerationError(f"Неверный запрос к Claude API (400): {exc}")
             raise AIGenerationError(f"Ошибка Claude API: {exc}")
         except Exception as exc:
             raise AIGenerationError(f"Ошибка генерации: {exc}")
@@ -1865,12 +1867,14 @@ class DescriptionGenerator:
                 raise AIGenerationError("Claude вернул пустое описание")
             return {"title": title, "description": description}
 
-        except anthropic.BadRequestError as exc:
-            raise AIGenerationError(f"Неверный запрос к Claude API (400): {exc}")
         except anthropic.APIError as exc:
+            # Anthropic возвращает нехватку кредитов как 400 invalid_request_error,
+            # поэтому проверяем текст ошибки ДО различения по типу/статус-коду
             msg = str(exc)
             if "credit balance is too low" in msg or "insufficient_quota" in msg:
                 raise AIGenerationError(f"CREDITS_EXHAUSTED:{exc}")
+            if isinstance(exc, anthropic.BadRequestError):
+                raise AIGenerationError(f"Неверный запрос к Claude API (400): {exc}")
             raise AIGenerationError(f"Ошибка Claude API: {exc}")
         except AIGenerationError:
             raise
