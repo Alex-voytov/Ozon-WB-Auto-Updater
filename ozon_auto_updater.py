@@ -1573,11 +1573,21 @@ WB_TITLE_MAX = 60
 WB_DESCRIPTION_SAFE_MAX = 2000
 
 
-def _enforce_wb_title(title: str, fallback: str = "") -> str:
-    """Приводит название к требованиям WB: без markdown/эмодзи, не длиннее WB_TITLE_MAX,
-    обрезка по границе слова, чтобы не рвать слово посередине."""
+# Спецсимволы, прямо запрещённые в названии карточки правилами WB
+# (seller.wildberries.ru → «Как создать карточку товара»)
+_WB_TITLE_FORBIDDEN_CHARS_RE = re.compile(r'[/*\-+@№%&$!=(){}\[\]]')
+
+
+def _enforce_wb_title(title: str, fallback: str = "", brand: str = "") -> str:
+    """Приводит название к требованиям WB: без markdown/эмодзи/спецсимволов, без бренда,
+    не длиннее WB_TITLE_MAX, обрезка по границе слова, чтобы не рвать слово посередине.
+    brand — если известен бренд товара (card["brand"]), он вырезается из названия как
+    подстраховка на случай, если генератор всё же включил его вопреки промпту."""
     def _clean_and_cut(raw: str) -> str:
         cleaned = re.sub(r'[*_`#>~]', '', (raw or "").strip())
+        if brand:
+            cleaned = re.sub(re.escape(brand), '', cleaned, flags=re.IGNORECASE)
+        cleaned = _WB_TITLE_FORBIDDEN_CHARS_RE.sub(' ', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         if len(cleaned) > WB_TITLE_MAX:
             cut = cleaned[:WB_TITLE_MAX]
@@ -1660,12 +1670,14 @@ class WbDescriptionGenerator:
         return _enforce_wb_description(result)
 
     def generate_wb_content(self, product_name: str, keywords: List[str],
-                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+                            competitors: Optional[List[Dict[str, str]]] = None,
+                            brand: str = "") -> Dict[str, str]:
         """Возвращает {"title", "description"} для карточки WB.
         Название здесь не переписывается творчески (шаблонный генератор без AI) —
-        только нормализуется под требования WB (без markdown, не длиннее WB_TITLE_MAX)."""
+        только нормализуется под требования WB (без markdown/спецсимволов/бренда,
+        не длиннее WB_TITLE_MAX)."""
         description = self.generate_description(product_name, keywords)
-        title = _enforce_wb_title(product_name, fallback=product_name)
+        title = _enforce_wb_title(product_name, fallback=product_name, brand=brand)
         return {"title": title, "description": description}
 
 
@@ -1768,10 +1780,10 @@ class DescriptionGenerator:
             raise AIGenerationError(f"Ошибка генерации: {exc}")
 
     def generate_wb_content(self, product_name: str, keywords: List[str],
-                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+                            competitors: Optional[List[Dict[str, str]]] = None,
+                            brand: str = "") -> Dict[str, str]:
         """Генерирует название и описание карточки WB одним запросом (JSON-ответ),
-        с учётом требований Wildberries: название ≤60 символов, описание без
-        доставки/цен/контактов/упоминаний других площадок."""
+        с учётом официальных требований Wildberries к полю «Наименование» и к описанию."""
         keywords_str = ", ".join(keywords[:10]) if keywords else "не указаны"
         comp_block = ""
         if competitors:
@@ -1785,18 +1797,26 @@ class DescriptionGenerator:
                 "Но напиши СВОЁ уникальное описание, не копируй текст:\n\n"
                 + "\n\n".join(lines)
             )
+        brand_line = f"\nБренд товара: «{brand}» — это слово НЕЛЬЗЯ включать в название (см. запрет ниже)." if brand else ""
         prompt = f"""Ты — профессиональный копирайтер для маркетплейса Wildberries. Составь название и SEO-описание карточки товара.
 
 Текущее название товара: {product_name}
-Ключевые слова для включения: {keywords_str}
+Ключевые слова для включения (в описание, не в название): {keywords_str}{brand_line}
 {comp_block}
 
-ТРЕБОВАНИЯ К НАЗВАНИЮ:
-- Не длиннее {WB_TITLE_MAX} символов (оптимально 40–60) — WB обрезает более длинные названия
-- Схема: тип товара + ключевая характеристика + назначение/объём/количество, без воды
-- Без маркетинговых эпитетов ("лучший", "премиум", "топ"), без обещаний, без повторов и синонимов одного и того же слова
-- Только кириллица и/или латиница, без эмодзи и спецсимволов кроме обычной пунктуации
-- Сохрани узнаваемость товара (бренд, ключевая характеристика), но убери дублирующиеся слова, если они есть в исходном названии
+ТРЕБОВАНИЯ К НАЗВАНИЮ (официальные правила Wildberries, за нарушение карточку блокируют):
+- Не длиннее {WB_TITLE_MAX} символов, и чем короче — тем лучше: название должно коротко и точно отвечать на вопрос "что изображено на фото в карточке", это НЕ SEO-заголовок со всеми характеристиками
+- Схема: тип товара + при необходимости одна ключевая характеристика, без воды
+- СТРОГО ЗАПРЕЩЕНО указывать в названии:
+  * бренд или производителя — для этого отдельное поле карточки, в названии бренда быть не должно
+  * синонимы и повторы слов
+  * лишние подробности: состав, способ применения, характеристики, которые не нужны для идентификации товара на фото
+  * слова ЗАГЛАВНЫМИ БУКВАМИ
+  * текст только латиницей без кириллицы (латиница допустима только внутри устоявшихся аббревиатур/единиц)
+  * спецсимволы: / \\ * - + @ № % & $ ! = ( ) {{ }} [ ]
+  * телефоны, email, ссылки, мессенджеры, эмодзи
+  * оценочные суждения: "лучший", "супер", "хит", "премиум", "топ"
+  * указание пола, возраста или сезона
 
 ТРЕБОВАНИЯ К ОПИСАНИЮ:
 - Длина: 900–1800 символов
@@ -1838,7 +1858,7 @@ class DescriptionGenerator:
             if not match:
                 raise AIGenerationError("Claude не вернул JSON с названием и описанием")
             data = json.loads(match.group(0))
-            title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name)
+            title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name, brand=brand)
             description = _sanitize_wb_description(str(data.get("description", "")))
             description = _enforce_wb_description(description)
             if not description:
@@ -2026,14 +2046,22 @@ class GeminiDescriptionGenerator:
     _WB_JSON_PROMPT = """Ты — профессиональный копирайтер для маркетплейса Wildberries. Составь название и описание карточки товара.
 
 Текущее название товара: {product_name}
-Ключевые поисковые запросы (вплети большинство в текст описания органично):
-{keywords_str}
+Ключевые поисковые запросы (вплети большинство в текст описания органично, не в название):
+{keywords_str}{brand_line}
 
-ТРЕБОВАНИЯ К НАЗВАНИЮ:
-- Не длиннее 60 символов (оптимально 40–60) — WB обрезает более длинные названия
-- Схема: тип товара + ключевая характеристика + назначение/объём/количество, без воды
-- Без маркетинговых эпитетов ("лучший", "премиум"), без повторов и синонимов одного и того же слова
-- Только кириллица и/или латиница, без эмодзи и спецсимволов кроме обычной пунктуации
+ТРЕБОВАНИЯ К НАЗВАНИЮ (официальные правила Wildberries, за нарушение карточку блокируют):
+- Не длиннее 60 символов, и чем короче — тем лучше: название должно коротко и точно отвечать на вопрос "что изображено на фото в карточке", это НЕ SEO-заголовок со всеми характеристиками
+- Схема: тип товара + при необходимости одна ключевая характеристика, без воды
+- СТРОГО ЗАПРЕЩЕНО указывать в названии:
+  * бренд или производителя — для этого отдельное поле карточки
+  * синонимы и повторы слов
+  * лишние подробности: состав, способ применения, характеристики, не нужные для идентификации товара на фото
+  * слова ЗАГЛАВНЫМИ БУКВАМИ
+  * текст только латиницей без кириллицы (латиница допустима только внутри устоявшихся аббревиатур/единиц)
+  * спецсимволы: / \\ * - + @ № % & $ ! = ( ) {{ }} [ ]
+  * телефоны, email, ссылки, мессенджеры, эмодзи
+  * оценочные суждения: "лучший", "супер", "хит", "премиум", "топ"
+  * указание пола, возраста или сезона
 
 ТРЕБОВАНИЯ К ОПИСАНИЮ (700–1600 символов, живой человеческий язык, не шаблонный копирайтинг):
 1. Суть товара и его главная польза
@@ -2054,11 +2082,15 @@ class GeminiDescriptionGenerator:
 {{"title": "новое название", "description": "текст описания"}}"""
 
     def generate_wb_content(self, product_name: str, keywords: List[str],
-                            competitors: Optional[List[Dict[str, str]]] = None) -> Dict[str, str]:
+                            competitors: Optional[List[Dict[str, str]]] = None,
+                            brand: str = "") -> Dict[str, str]:
         """Генерирует название и описание карточки WB одним запросом (JSON-ответ)."""
         kws = keywords[:25] if keywords else []
         keywords_str = "\n".join(f"- {kw}" for kw in kws) if kws else "- (не указаны)"
-        prompt = self._WB_JSON_PROMPT.format(product_name=product_name, keywords_str=keywords_str)
+        brand_line = (f"\nБренд товара: «{brand}» — это слово НЕЛЬЗЯ включать в название "
+                      f"(см. запрет ниже)." if brand else "")
+        prompt = self._WB_JSON_PROMPT.format(product_name=product_name, keywords_str=keywords_str,
+                                             brand_line=brand_line)
         if competitors:
             comp_lines = []
             for i, c in enumerate(competitors[:3], 1):
@@ -2078,7 +2110,7 @@ class GeminiDescriptionGenerator:
             data = json.loads(match.group(0))
         except json.JSONDecodeError as exc:
             raise AIGenerationError(f"Gemini вернул повреждённый JSON: {exc}")
-        title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name)
+        title = _enforce_wb_title(str(data.get("title", "")), fallback=product_name, brand=brand)
         description = _sanitize_wb_description(str(data.get("description", "")))
         description = _enforce_wb_description(description)
         if not description:
@@ -2288,6 +2320,7 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
         vendor_code = card.get("vendorCode") or card.get("nmID", "?")
         product_name = card.get("title") or card.get("subjectName") or str(vendor_code)
         nm_id = card.get("nmID")
+        brand = str(card.get("brand") or "").strip()
         log(f"{'=' * 50}")
         log(f"Обработка: {vendor_code}")
         log(f"  Название: {str(product_name)[:60]}")
@@ -2356,14 +2389,14 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
 
         try:
             content = generator.generate_wb_content(product_name, keywords,
-                                                    competitors=competitors or None)
+                                                    competitors=competitors or None, brand=brand)
         except AIGenerationError as exc:
             emsg = str(exc)
             if emsg.startswith("CREDITS_EXHAUSTED:"):
                 log(f"  Лимит AI исчерпан ({emsg[18:60]}) — переключаемся на шаблонный генератор WB")
                 fallback = WbDescriptionGenerator()
                 try:
-                    content = fallback.generate_wb_content(product_name, keywords)
+                    content = fallback.generate_wb_content(product_name, keywords, brand=brand)
                 except Exception as exc2:
                     log(f"  ОШИБКА шаблонного генератора: {exc2}")
                     return "error"
@@ -2376,7 +2409,7 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
 
         # Дополнительная проверка на соответствие требованиям WB — на случай, если
         # генератор всё же вернул что-то, выходящее за лимиты (защита от регрессий)
-        new_title = _enforce_wb_title(content.get("title", ""), fallback=product_name)
+        new_title = _enforce_wb_title(content.get("title", ""), fallback=product_name, brand=brand)
         new_description = _enforce_wb_description(_sanitize_wb_description(content.get("description", "")))
         if not new_description:
             log("  ОШИБКА: пустое описание после проверки требований WB")
