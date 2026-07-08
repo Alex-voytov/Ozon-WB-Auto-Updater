@@ -1656,10 +1656,16 @@ WB_DESCRIPTION_SAFE_MAX = 2000
 # (seller.wildberries.ru → «Как создать карточку товара»)
 _WB_TITLE_FORBIDDEN_CHARS_RE = re.compile(r'[/*\-+@№%&$!=(){}\[\]]')
 
+# Предлоги/союзы, которые бессмысленны, если остаются последним словом при обрезке
+# (например «...с витамином С со» — «со» без «вкусом» после теряет смысл)
+_WB_TITLE_DANGLING_WORDS = STOP_WORDS | {'со', 'во', 'ко', 'изо', 'обо', 'ото', 'подо', 'надо', 'передо'}
+
 
 def _enforce_wb_title(title: str, fallback: str = "", brand: str = "") -> str:
     """Приводит название к требованиям WB: без markdown/эмодзи/спецсимволов, без бренда,
-    не длиннее WB_TITLE_MAX, обрезка по границе слова, чтобы не рвать слово посередине.
+    не длиннее WB_TITLE_MAX. При обрезке предпочитает границу последней запятой (тогда
+    остаётся законченная по смыслу фраза), иначе — границу слова с удалением повисших
+    предлогов/союзов на конце.
     brand — если известен бренд товара (card["brand"]), он вырезается из названия как
     подстраховка на случай, если генератор всё же включил его вопреки промпту."""
     def _clean_and_cut(raw: str) -> str:
@@ -1667,13 +1673,23 @@ def _enforce_wb_title(title: str, fallback: str = "", brand: str = "") -> str:
         if brand:
             cleaned = re.sub(re.escape(brand), '', cleaned, flags=re.IGNORECASE)
         cleaned = _WB_TITLE_FORBIDDEN_CHARS_RE.sub(' ', cleaned)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        if len(cleaned) > WB_TITLE_MAX:
-            cut = cleaned[:WB_TITLE_MAX]
-            if ' ' in cut:
-                cut = cut.rsplit(' ', 1)[0]
-            cleaned = cut.strip()
-        return cleaned
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' ,')
+        if len(cleaned) <= WB_TITLE_MAX:
+            return cleaned
+
+        head = cleaned[:WB_TITLE_MAX]
+        comma_cut = head.rfind(',')
+        if comma_cut >= 15:  # не берём слишком короткий обрубок до запятой
+            cleaned = cleaned[:comma_cut]
+        else:
+            if ' ' in head:
+                head = head.rsplit(' ', 1)[0]
+            cleaned = head
+
+        words = cleaned.strip(' ,').split(' ')
+        while len(words) > 1 and words[-1].lower().strip(',') in _WB_TITLE_DANGLING_WORDS:
+            words.pop()
+        return ' '.join(words).strip(' ,')
 
     result = _clean_and_cut(title)
     return result or _clean_and_cut(fallback)
