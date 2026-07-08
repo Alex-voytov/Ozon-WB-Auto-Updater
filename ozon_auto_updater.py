@@ -843,6 +843,257 @@ class WbPricesClient:
 
 
 # ============================================================================
+# КЛИЕНТ WB ADVERT API (реклама) — управление ставками
+# ============================================================================
+
+WB_ADVERT_BASE = "https://advert-api.wildberries.ru"
+
+
+class WbAdvertError(RuntimeError):
+    pass
+
+
+class WbAdvertClient:
+    """Клиент для WB Advertising API: список кампаний, статистика, изменение ставки (CPM).
+
+    Точная схема некоторых полей ответа WB не подтверждена официальной документацией
+    на момент написания (сама документация — JS-страница, недоступна для автоматической
+    проверки в этой среде) — поэтому код логирует «сырые» ответы на уровне INFO в
+    marketplace_manager.log при первом использовании каждого метода, чтобы расхождение
+    со схемой было сразу видно и легко исправить."""
+
+    def __init__(self, api_key: str, timeout: int = 30):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        })
+
+    def _request(self, method: str, path: str, max_retries: int = 0, **kwargs) -> Any:
+        # По умолчанию без ретраев: на практике 429 этого API держится часами, а не
+        # секундами — повторные попытки внутри одного вызова только добавляют лишние
+        # запросы и не помогают. Явно передайте max_retries>0, если нужен обратный эффект.
+        url = WB_ADVERT_BASE + path
+        for attempt in range(max_retries + 1):
+            resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            if resp.status_code == 429 and attempt < max_retries:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after else 0
+                except ValueError:
+                    wait = 0
+                wait = max(wait, 2 ** attempt)
+                logging.info(f"[WB Advert {path}] 429 — ждём {wait}с (попытка {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            if not resp.ok:
+                raise WbAdvertError(f"{path} -> {resp.status_code}: {resp.text[:500]}")
+            return resp
+
+    def get_campaigns(self, include_statuses: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+        """Возвращает список кампаний с полями advertId, name, type, status и, если удалось
+        определить, текущей ставкой в "_cpm". Кампании, где ставку определить не удалось,
+        по-прежнему возвращаются (для отображения), но с "_cpm": None — их нужно
+        пропускать при автоматической регулировке.
+
+        По умолчанию берём только активные (9) и приостановленные (11) кампании —
+        менять ставку на завершённых/отклонённых бессмысленно, а их может быть очень
+        много (сотни), что и увеличивает риск запроса деталей упереться в лимит WB."""
+        if include_statuses is None:
+            include_statuses = [9, 11]
+
+        resp = self._request("GET", "/adv/v1/promotion/count")
+        data = resp.json()
+        logging.info(f"[WB Advert promotion/count] group counts: "
+                    f"{[(g.get('type'), g.get('status'), g.get('count')) for g in (data.get('adverts') or [])]}")
+        ids: List[int] = []
+        for group in (data.get("adverts") or []):
+            if group.get("status") not in include_statuses:
+                continue
+            for item in (group.get("advert_list") or []):
+                advert_id = item.get("advertId")
+                if advert_id:
+                    ids.append(advert_id)
+        if not ids:
+            return []
+
+        details = self._fetch_advert_details(ids)
+        result: List[Dict[str, Any]] = []
+        for camp in details:
+            if not isinstance(camp, dict):
+                continue
+            advert_id = camp.get("advertId") or camp.get("id")
+            cpm = self._extract_cpm(camp)
+            result.append({
+                "advertId": advert_id,
+                "name": camp.get("name") or str(advert_id),
+                "type": camp.get("type"),
+                "status": camp.get("status"),
+                "_cpm": cpm,
+                "_raw": camp,
+            })
+        return result
+
+    def _fetch_advert_details(self, ids: List[int]) -> List[Dict[str, Any]]:
+        """Запрашивает детали кампаний (имя, тип, ставка) по списку advertId.
+        Точная схема этого эндпоинта не подтверждена официальной документацией на
+        момент написания — пробуем самый вероятный вариант (GET со списком id в
+        query), затем один запасной (POST с телом-списком id). Оба варианта
+        логируются на уровне INFO, чтобы при ошибке сразу было видно, что вернул WB."""
+        attempts = [
+            ("GET", "/adv/v1/promotion/adverts", {"params": {"ids": ",".join(map(str, ids))}}),
+            ("POST", "/adv/v1/promotion/adverts", {"json": ids}),
+        ]
+        for method, path, kwargs in attempts:
+            try:
+                resp = self._request(method, path, **kwargs)
+            except WbAdvertError as exc:
+                logging.info(f"[WB Advert details] {method} {path} — ошибка: {exc}")
+                continue
+            details = resp.json()
+            if not isinstance(details, list):
+                details = details.get("adverts") or details.get("result") or []
+            if details:
+                logging.info(f"[WB Advert details] {method} {path} — OK, sample: {str(details[0])[:800]}")
+                return details
+            logging.info(f"[WB Advert details] {method} {path} — пустой ответ")
+        logging.info("[WB Advert details] не удалось получить детали кампаний ни одним из вариантов")
+        return []
+
+    @staticmethod
+    def _extract_cpm(camp: Dict[str, Any]) -> Optional[int]:
+        """Ищет текущую ставку (CPM) в структуре кампании — расположение поля отличается
+        по типу кампании (авто/аукцион/старые ручные), поэтому пробуем несколько вариантов."""
+        if isinstance(camp.get("cpm"), (int, float)):
+            return int(camp["cpm"])
+        united = camp.get("unitedParams")
+        if isinstance(united, list) and united:
+            for u in united:
+                if isinstance(u, dict) and isinstance(u.get("cpm"), (int, float)):
+                    return int(u["cpm"])
+        for key in ("params", "searchPluses", "seacat"):
+            block = camp.get(key)
+            if isinstance(block, list):
+                for item in block:
+                    if isinstance(item, dict) and isinstance(item.get("cpm"), (int, float)):
+                        return int(item["cpm"])
+            elif isinstance(block, dict) and isinstance(block.get("cpm"), (int, float)):
+                return int(block["cpm"])
+        return None
+
+    def get_campaign_stats_3d(self, campaign_id: int) -> Dict[str, float]:
+        """Расход, выручка и число заказов кампании за последние 3 дня (сегодня + 2)."""
+        today = datetime.date.today()
+        dates = [(today - datetime.timedelta(days=i)).isoformat() for i in range(3)]
+        resp = self._request("POST", "/adv/v2/fullstats", json=[{"id": campaign_id, "dates": dates}])
+        data = resp.json()
+        logging.info(f"[WB Advert fullstats {campaign_id}] sample: {str(data)[:600]}")
+
+        rows = data if isinstance(data, list) else (data.get("result") or [])
+        spend = revenue = 0.0
+        orders = 0
+        for camp_stat in rows:
+            if not isinstance(camp_stat, dict):
+                continue
+            if camp_stat.get("advertId") not in (None, campaign_id):
+                continue
+            for day in (camp_stat.get("days") or []):
+                spend += float(day.get("sum") or 0)
+                revenue += float(day.get("sum_price") or day.get("sumPrice") or 0)
+                orders += int(day.get("orders") or 0)
+        return {"spend": spend, "revenue": revenue, "orders": orders}
+
+    def set_campaign_bid(self, campaign_id: int, campaign_type: Optional[int], new_cpm: int) -> None:
+        """Изменяет ставку (CPM) кампании. campaign_type обязателен для аукционных
+        кампаний (type=9) — передаём тот же тип, что вернул get_campaigns()."""
+        payload: Dict[str, Any] = {"advertId": campaign_id, "cpm": int(new_cpm)}
+        if campaign_type is not None:
+            payload["type"] = campaign_type
+        logging.info(f"[WB Advert set_bid {campaign_id}] payload: {payload}")
+        self._request("POST", "/adv/v0/cpm", json=payload)
+
+
+# ДРР (доля рекламных расходов) вне этого коридора вокруг цели считается отклонением —
+# без него ставка дёргалась бы каждый цикл из-за шумовых колебаний в пределах цели
+WB_ADS_DRR_DEADBAND_PP = 1.0
+
+
+def run_wb_ads_cycle(advert: WbAdvertClient, campaigns_cfg: Dict[str, Dict[str, Any]],
+                     step_pct: float, log_fn=None) -> None:
+    """Один проход по включённым рекламным кампаниям WB: считает фактический ДРР за
+    последние 3 дня и меняет ставку на step_pct в сторону цели, если отклонение больше
+    WB_ADS_DRR_DEADBAND_PP. campaigns_cfg: {"<advertId>": {"target_drr": float, "enabled": bool}}."""
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    log(f"{'=' * 50}")
+    log(f"Проверка ДРР по кампаниям — {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+    try:
+        campaigns = advert.get_campaigns()
+    except Exception as exc:
+        log(f"  ОШИБКА получения списка кампаний: {exc}")
+        return
+
+    active = [c for c in campaigns if str(c.get("advertId")) in campaigns_cfg
+             and campaigns_cfg[str(c.get("advertId"))].get("enabled")]
+    if not active:
+        log("  Нет кампаний с включённой авторегулировкой")
+        return
+
+    for camp in active:
+        camp_id = camp.get("advertId")
+        name = camp.get("name") or str(camp_id)
+        target_drr = campaigns_cfg[str(camp_id)].get("target_drr")
+        current_cpm = camp.get("_cpm")
+
+        if not target_drr:
+            log(f"  {name}: не задана целевая ДРР — пропуск")
+            continue
+        if current_cpm is None:
+            log(f"  {name}: не удалось определить текущую ставку из ответа WB — пропуск")
+            continue
+
+        try:
+            stats = advert.get_campaign_stats_3d(camp_id)
+        except Exception as exc:
+            log(f"  {name}: ошибка получения статистики — {exc}")
+            continue
+
+        spend = stats["spend"]
+        revenue = stats["revenue"]
+        if revenue <= 0:
+            log(f"  {name}: нет заказов за 3 дня (расход {spend:.0f}₽) — недостаточно данных, пропуск")
+            continue
+
+        actual_drr = spend / revenue * 100
+        log(f"  {name}: ставка={current_cpm}, расход(3д)={spend:.0f}₽, выручка(3д)={revenue:.0f}₽, "
+            f"факт. ДРР={actual_drr:.1f}% (цель {target_drr:.1f}%)")
+
+        if actual_drr > target_drr + WB_ADS_DRR_DEADBAND_PP:
+            new_cpm = max(1, round(current_cpm * (1 - step_pct / 100)))
+            direction = "ДРР выше цели — понижаем"
+        elif actual_drr < target_drr - WB_ADS_DRR_DEADBAND_PP:
+            new_cpm = round(current_cpm * (1 + step_pct / 100))
+            direction = "ДРР ниже цели — повышаем"
+        else:
+            log(f"  {name}: ДРР в пределах цели — ставку не меняем")
+            continue
+
+        if new_cpm == current_cpm:
+            log(f"  {name}: расчётная ставка не изменилась ({new_cpm})")
+            continue
+
+        try:
+            advert.set_campaign_bid(camp_id, camp.get("type"), new_cpm)
+            log(f"  {name}: {direction}, {current_cpm} → {new_cpm}")
+        except Exception as exc:
+            log(f"  {name}: ОШИБКА установки ставки — {exc}")
+
+
+# ============================================================================
 # КЛИЕНТ MPSTATS API
 # ============================================================================
 
@@ -2592,7 +2843,8 @@ def load_config() -> Dict[str, Any]:
             "mpstats": {"token": ""},
             "ai": {"provider": "template", "anthropic_api_key": "", "model": "claude-opus-4-8",
                    "gemini_api_key": "", "gemini_model": "gemini-2.0-flash"},
-            "update": {"days_back": 30, "top_keywords": 15, "target_offer_ids": []}
+            "update": {"days_back": 30, "top_keywords": 15, "target_offer_ids": []},
+            "wb_ads": {"step_pct": 10.0, "campaigns": {}},
         }
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -3557,6 +3809,60 @@ class TransferDialog(tk.Toplevel):
             ))
 
 
+class AdsCampaignSettingsDialog(tk.Toplevel):
+    """Диалог задания целевой ДРР и включения авторегулировки для одной рекламной кампании WB."""
+
+    def __init__(self, parent, campaign: Dict[str, Any], current: Dict[str, Any]):
+        super().__init__(parent)
+        self.title(f"Настройка кампании — {campaign.get('name', '')}")
+        self.geometry("420x220")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result: Optional[Dict[str, Any]] = None
+
+        info = (f"{campaign.get('name', '')}\n"
+               f"ID: {campaign.get('advertId')}   Текущая ставка: {campaign.get('_cpm', '?')}")
+        ttk.Label(self, text=info, wraplength=380, justify="left").pack(padx=14, pady=(14, 8), anchor="w")
+
+        rf = ttk.Frame(self); rf.pack(padx=14, pady=6, fill="x")
+        ttk.Label(rf, text="Целевая ДРР, %:").pack(side="left")
+        self.target_var = tk.StringVar(value=str(current.get("target_drr", "") or ""))
+        ttk.Entry(rf, textvariable=self.target_var, width=10).pack(side="left", padx=8)
+
+        self.enabled_var = tk.BooleanVar(value=bool(current.get("enabled")))
+        ttk.Checkbutton(self, text="Включить авторегулировку ставки для этой кампании",
+                       variable=self.enabled_var).pack(padx=14, pady=8, anchor="w")
+
+        hint = ttk.Label(self, text="ДРР = расход на рекламу / выручка от заказов × 100%.\n"
+                                    "Если фактическая ДРР выше цели — ставка снижается, если ниже — повышается.",
+                         foreground="gray", wraplength=380, justify="left")
+        hint.pack(padx=14, pady=(0, 8), anchor="w")
+
+        bf = ttk.Frame(self); bf.pack(pady=10)
+        ttk.Button(bf, text="Сохранить", command=self._save).pack(side="left", padx=6)
+        ttk.Button(bf, text="Отмена", command=self.destroy).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_window()
+
+    def _save(self):
+        raw = self.target_var.get().strip().replace(",", ".")
+        target_drr = None
+        if raw:
+            try:
+                target_drr = float(raw)
+            except ValueError:
+                messagebox.showerror("Ошибка", "Целевая ДРР должна быть числом.", parent=self)
+                return
+        if self.enabled_var.get() and not target_drr:
+            messagebox.showerror("Ошибка", "Укажите целевую ДРР, чтобы включить авторегулировку.", parent=self)
+            return
+        self.result = {"target_drr": target_drr, "enabled": self.enabled_var.get()}
+        self.destroy()
+
+
 class PreviewDialog(tk.Toplevel):
     """Модальный диалог для сравнения старого и нового описания."""
 
@@ -3663,6 +3969,8 @@ class App(tk.Tk):
         self._stop_event = threading.Event()
         self._wb_stop_event = threading.Event()
         self._prices_stop_event = threading.Event()
+        self._ads_stop_event = threading.Event()
+        self._ads_campaigns: List[Dict[str, Any]] = []
         self._log_queue: queue.Queue = queue.Queue()
 
         self._setup_logging()
@@ -3886,6 +4194,8 @@ class App(tk.Tk):
         self._build_prices_tab(pf, marketplace="wb")
         tf = ttk.Frame(nb); nb.add(tf, text="  Товары  ")
         self._build_products_tab(tf, marketplace="wb")
+        af = ttk.Frame(nb); nb.add(af, text="  Реклама  ")
+        self._build_wb_ads_tab(af)
 
     def _build_wb_desc_tab(self, parent: ttk.Frame):
         ttk.Label(parent, text="Обновление описаний товаров Wildberries", font=("", 10, "bold")).pack(padx=16, pady=(12, 4), anchor="w")
@@ -4053,6 +4363,191 @@ class App(tk.Tk):
             self.products_menu_wb = menu
             self.products_status_wb = sl
             self.products_pb_wb = pb
+
+    # ─────────────────────── WB — РЕКЛАМА (АВТО-СТАВКИ) ─────────────────
+
+    _ADS_TYPE_LABELS = {4: "каталог", 5: "поиск", 6: "карточка товара", 7: "рекомендации",
+                        8: "авто", 9: "аукцион"}
+    _ADS_STATUS_LABELS = {4: "готова к запуску", 7: "завершена", 8: "отклонена",
+                          9: "активна", 11: "на паузе"}
+
+    def _build_wb_ads_tab(self, parent: ttk.Frame):
+        ttk.Label(parent, text="Автоматическая регулировка ставок по ДРР",
+                 font=("", 10, "bold")).pack(padx=16, pady=(12, 2), anchor="w")
+        hint = ("Каждые 5 минут скрипт считает фактическую ДРР кампании за скользящие 3 дня "
+                "(расход / выручка) и меняет ставку на заданный шаг в сторону цели. "
+                "Изменения применяются сразу к живым кампаниям, без предпросмотра.\n"
+                "Дважды кликните по кампании, чтобы задать целевую ДРР и включить для неё авторегулировку.")
+        ttk.Label(parent, text=hint, foreground="gray", wraplength=1000, justify="left").pack(padx=16, anchor="w")
+
+        bf = ttk.Frame(parent); bf.pack(padx=16, pady=8, anchor="w")
+        self.ads_load_btn = ttk.Button(bf, text="Загрузить кампании", command=self._load_wb_ads_campaigns)
+        self.ads_load_btn.pack(side="left", padx=4)
+        ttk.Label(bf, text="Шаг ставки, %:").pack(side="left", padx=(16, 4))
+        self.ads_step_pct = tk.StringVar(value=str(self.config_data.get("wb_ads", {}).get("step_pct", 10)))
+        ttk.Spinbox(bf, from_=1, to=50, increment=1, width=6, textvariable=self.ads_step_pct).pack(side="left")
+        self.ads_start_btn = ttk.Button(bf, text="Запустить авторегулировку", command=self._start_ads_auto)
+        self.ads_start_btn.pack(side="left", padx=(16, 4))
+        self.ads_stop_btn = ttk.Button(bf, text="Остановить", command=self._stop_ads_auto, state="disabled")
+        self.ads_stop_btn.pack(side="left", padx=4)
+
+        self.ads_status_label = ttk.Label(parent, text="Нажмите 'Загрузить кампании'", foreground="gray")
+        self.ads_status_label.pack(padx=16, pady=(0, 4), anchor="w")
+
+        cols = ("id", "name", "type", "status", "cpm", "target_drr", "enabled")
+        heads = ("ID", "Кампания", "Тип", "Статус", "Ставка", "Цель ДРР, %", "Авто")
+        widths = (90, 320, 100, 110, 80, 90, 60)
+        tf = ttk.Frame(parent); tf.pack(fill="both", expand=True, padx=16, pady=4)
+        vsb = ttk.Scrollbar(tf, orient="vertical")
+        tree = ttk.Treeview(tf, columns=cols, show="headings", yscrollcommand=vsb.set, height=12)
+        vsb.config(command=tree.yview); vsb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        for col, head, w in zip(cols, heads, widths):
+            tree.heading(col, text=head)
+            tree.column(col, width=w, minwidth=40, anchor="center")
+        tree.column("name", anchor="w")
+        tree.tag_configure("enabled", foreground="#4caf50")
+        tree.bind("<Double-1>", self._on_ads_campaign_dblclick)
+        self.ads_tree = tree
+
+        lf = ttk.LabelFrame(parent, text="Журнал авторегулировки")
+        lf.pack(fill="both", expand=True, padx=16, pady=6)
+        self.ads_log_text = scrolledtext.ScrolledText(lf, state="disabled", wrap="word", height=8,
+                                                       font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.ads_log_text.pack(fill="both", expand=True, padx=4, pady=4)
+        ttk.Button(lf, text="Очистить", command=lambda: self._clear_tab_log(self.ads_log_text)).pack(anchor="w", padx=4, pady=2)
+
+    def _ads_log(self, msg: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        def _append():
+            self.ads_log_text.config(state="normal")
+            self.ads_log_text.insert("end", line)
+            self.ads_log_text.see("end")
+            self.ads_log_text.config(state="disabled")
+        self.after(0, _append)
+
+    def _load_wb_ads_campaigns(self):
+        wb_key = self.config_data.get("wb", {}).get("api_key", "")
+        if not wb_key:
+            messagebox.showerror("Реклама WB", "Укажите WB API Token в Настройках.")
+            return
+        # Блокируем кнопку на время запроса — повторный клик во время ожидания запускал
+        # второй параллельный запрос к тому же лимитированному эндпоинту и только продлевал 429
+        self.ads_load_btn.config(state="disabled")
+        self.ads_status_label.config(text="Загрузка кампаний...", foreground="gray")
+        threading.Thread(target=self._load_wb_ads_campaigns_thread, args=(wb_key,), daemon=True).start()
+
+    def _load_wb_ads_campaigns_thread(self, wb_key: str):
+        advert = WbAdvertClient(wb_key)
+        try:
+            campaigns = advert.get_campaigns()
+        except Exception as exc:
+            emsg = str(exc)
+            if "429" in emsg:
+                self._ads_log("Лимит запросов WB Advert API исчерпан — подождите и попробуйте позже "
+                             "(не нажимайте кнопку повторно сразу, это только продлевает блокировку)")
+                self.after(0, lambda: self.ads_status_label.config(
+                    text="Лимит запросов WB исчерпан — попробуйте позже", foreground="red"))
+            else:
+                self._ads_log(f"Ошибка загрузки кампаний: {exc}")
+                self.after(0, lambda: self.ads_status_label.config(text=f"Ошибка: {exc}", foreground="red"))
+            self.after(0, lambda: self.ads_load_btn.config(state="normal"))
+            return
+        self._ads_campaigns = campaigns
+        campaigns_cfg = self.config_data.get("wb_ads", {}).get("campaigns", {})
+
+        def _fill():
+            tree = self.ads_tree
+            tree.delete(*tree.get_children())
+            for c in campaigns:
+                camp_id = str(c.get("advertId"))
+                camp_cfg = campaigns_cfg.get(camp_id, {})
+                target = camp_cfg.get("target_drr")
+                enabled = bool(camp_cfg.get("enabled"))
+                type_label = self._ADS_TYPE_LABELS.get(c.get("type"), str(c.get("type")))
+                status_label = self._ADS_STATUS_LABELS.get(c.get("status"), str(c.get("status")))
+                cpm = c.get("_cpm")
+                tree.insert("", "end", iid=camp_id, values=(
+                    camp_id, c.get("name"), type_label, status_label,
+                    cpm if cpm is not None else "?",
+                    f"{target:.0f}" if target else "—",
+                    "Да" if enabled else "Нет",
+                ), tags=("enabled",) if enabled else ())
+            self.ads_status_label.config(text=f"Кампаний: {len(campaigns)}", foreground="black")
+            self.ads_load_btn.config(state="normal")
+        self.after(0, _fill)
+
+    def _on_ads_campaign_dblclick(self, event):
+        item = self.ads_tree.identify_row(event.y)
+        if not item:
+            return
+        camp = next((c for c in self._ads_campaigns if str(c.get("advertId")) == item), None)
+        if not camp:
+            return
+        campaigns_cfg = self.config_data.setdefault("wb_ads", {}).setdefault("campaigns", {})
+        current = campaigns_cfg.get(item, {})
+        dlg = AdsCampaignSettingsDialog(self, camp, current)
+        if dlg.result is None:
+            return
+        campaigns_cfg[item] = dlg.result
+        self._save_ads_settings()
+        self._load_wb_ads_campaigns()
+
+    def _save_ads_settings(self):
+        cfg = dict(self.config_data)
+        wb_ads = dict(cfg.get("wb_ads", {}))
+        try:
+            wb_ads["step_pct"] = float(self.ads_step_pct.get())
+        except (ValueError, AttributeError):
+            wb_ads["step_pct"] = wb_ads.get("step_pct", 10.0)
+        cfg["wb_ads"] = wb_ads
+        save_config(cfg)
+        self.config_data = cfg
+
+    def _start_ads_auto(self):
+        self._save_ads_settings()
+        wb_key = self.config_data.get("wb", {}).get("api_key", "")
+        if not wb_key:
+            messagebox.showerror("Реклама WB", "Укажите WB API Token в Настройках.")
+            return
+        campaigns_cfg = self.config_data.get("wb_ads", {}).get("campaigns", {})
+        if not any(c.get("enabled") for c in campaigns_cfg.values()):
+            messagebox.showinfo("Реклама WB",
+                               "Нет кампаний с включённой авторегулировкой. "
+                               "Дважды кликните по кампании в списке, чтобы включить.")
+            return
+        if not messagebox.askyesno(
+            "Подтверждение",
+            "Каждые 5 минут ставка на включённых кампаниях будет автоматически меняться "
+            "на основе фактической ДРР. Изменения применяются сразу к живым кампаниям, "
+            "без предварительного подтверждения каждого шага. Запустить?"
+        ):
+            return
+        self._ads_stop_event.clear()
+        self.ads_start_btn.config(state="disabled")
+        self.ads_stop_btn.config(state="normal")
+        self._ads_log("Автоматическая регулировка ставок запущена (проверка каждые 5 минут)")
+        threading.Thread(target=self._ads_loop, daemon=True).start()
+
+    def _stop_ads_auto(self):
+        self._ads_stop_event.set()
+        self.ads_start_btn.config(state="normal")
+        self.ads_stop_btn.config(state="disabled")
+        self._ads_log("Остановлено пользователем")
+
+    def _ads_loop(self):
+        wb_key = self.config_data.get("wb", {}).get("api_key", "")
+        advert = WbAdvertClient(wb_key)
+        while not self._ads_stop_event.is_set():
+            wb_ads_cfg = self.config_data.get("wb_ads", {})
+            step_pct = wb_ads_cfg.get("step_pct", 10.0)
+            campaigns_cfg = wb_ads_cfg.get("campaigns", {})
+            try:
+                run_wb_ads_cycle(advert, campaigns_cfg, step_pct, log_fn=self._ads_log)
+            except Exception as exc:
+                self._ads_log(f"ОШИБКА цикла регулировки: {exc}")
+            self._ads_stop_event.wait(300)  # 5 минут, но реагирует на Стоп сразу
 
     def _on_product_dblclick(self, event, marketplace: str, tree: ttk.Treeview):
         item = tree.identify_row(event.y)
@@ -4419,7 +4914,10 @@ class App(tk.Tk):
 
     def _save_settings(self):
         try:
-            cfg = {
+            # Начинаем с копии текущего конфига, чтобы не затереть разделы, которыми
+            # эта вкладка не управляет (например wb_ads — настройки авторегулировки ставок)
+            cfg = dict(self.config_data)
+            cfg.update({
                 "ozon": {"client_id": self.ozon_client_id.get().strip(), "api_key": self.ozon_api_key.get().strip()},
                 "wb": {"api_key": self.wb_api_key.get().strip()},
                 "mpstats": {"token": self.mpstats_token.get().strip()},
@@ -4440,7 +4938,7 @@ class App(tk.Tk):
                     "top_keywords": int(self.top_keywords.get()),
                     "target_offer_ids": [s.strip() for s in self.target_ids.get().split(",") if s.strip()],
                 },
-            }
+            })
             save_config(cfg)
             self.config_data = cfg
             messagebox.showinfo("Настройки", "Сохранено.")
