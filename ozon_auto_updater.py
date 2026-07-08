@@ -1624,6 +1624,18 @@ class OzonPerformanceClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _put(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        self._ensure_token()
+        resp = self.session.put(
+            f"{OZON_PERF_BASE}{path}",
+            headers={"Authorization": f"Bearer {self._token}"},
+            json=body,
+            timeout=self.timeout,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"{path} -> {resp.status_code}: {resp.text[:500]}")
+        return resp.json() if resp.text else {}
+
     def get_campaigns(self) -> List[Dict[str, Any]]:
         data = self._get("/api/client/campaign", {"state": "CAMPAIGN_STATE_RUNNING"})
         return data.get("list", [])
@@ -1648,6 +1660,43 @@ class OzonPerformanceClient:
             pass
         return list(skus)
 
+    def get_campaign_products(self, campaign_id: str) -> List[str]:
+        """SKU всех товаров конкретной кампании (без агрегации по всем кампаниям)."""
+        data = self._get(f"/api/client/campaign/{campaign_id}/objects")
+        return [str(o.get("id")) for o in data.get("list", []) if o.get("id")]
+
+    def get_competitive_bids(self, campaign_id: str, skus: List[str]) -> Dict[str, float]:
+        """Ставка (в рублях) по товарам кампании — эндпоинт "Конкурентные ставки для
+        товара" (/products/bids/competitive). Возвращает данные только для SKU, уже
+        добавленных в эту кампанию. Ozon хранит денежные величины как целое ×1_000_000
+        (как и бюджеты кампаний) — здесь переводим сразу в рубли.
+        Точная семантика поля "bid" не подтверждена официальной документацией: похоже,
+        что это скорее эффективная ставка товара в рамках кампании, чем независимая
+        рыночная ставка конкурентов — используем как лучший доступный ориентир."""
+        if not skus:
+            return {}
+        data = self._get(f"/api/client/campaign/{campaign_id}/products/bids/competitive",
+                         params={"skus": skus})
+        result: Dict[str, float] = {}
+        for item in data.get("bids", []):
+            sku = str(item.get("sku", ""))
+            try:
+                result[sku] = float(item.get("bid", 0)) / 1_000_000
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def set_bids(self, campaign_id: str, bids: Dict[str, float]) -> None:
+        """Устанавливает ставку (CPC, в рублях) для товаров кампании.
+        bids: {sku: ставка_в_рублях}."""
+        payload = {
+            "bids": [
+                {"sku": sku, "bid": str(int(round(bid * 1_000_000)))}
+                for sku, bid in bids.items()
+            ]
+        }
+        self._put(f"/api/client/campaign/{campaign_id}/products", payload)
+
     def test_connection(self) -> str:
         """Проверяет подключение. Возвращает 'ok' или описание ошибки."""
         try:
@@ -1655,6 +1704,65 @@ class OzonPerformanceClient:
             return "ok"
         except Exception as exc:
             return str(exc)
+
+
+# Кампании с автостратегией (например TARGET_BIDS) игнорируют вручную заданную
+# ставку — Ozon сам подбирает её. Авторегулировку можно применять только к
+# кампаниям без автостратегии.
+OZON_ADS_MANUAL_STRATEGY = "NO_AUTO_STRATEGY"
+
+
+def run_ozon_ads_cycle(perf: OzonPerformanceClient, products_cfg: Dict[str, Dict[str, Any]],
+                       log_fn=None) -> None:
+    """Один проход по включённым товарам в рекламе Ozon: сравнивает конкурентную ставку
+    с целевой наценкой и подстраивает свою ставку (CPC), чтобы держаться выше конкурентов
+    на заданный процент. products_cfg: ключ "<campaignId>:<sku>" -> {"margin_pct", "enabled"}."""
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    log(f"{'=' * 50}")
+    log(f"Проверка ставок Ozon — {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+    active = {k: v for k, v in products_cfg.items() if v.get("enabled")}
+    if not active:
+        log("  Нет товаров с включённой авторегулировкой")
+        return
+
+    by_campaign: Dict[str, List[str]] = {}
+    for key in active:
+        camp_id, _, sku = key.partition(":")
+        if camp_id and sku:
+            by_campaign.setdefault(camp_id, []).append(sku)
+
+    for camp_id, skus in by_campaign.items():
+        try:
+            competitive = perf.get_competitive_bids(camp_id, skus)
+        except Exception as exc:
+            log(f"  Кампания {camp_id}: ошибка получения конкурентных ставок — {exc}")
+            continue
+
+        new_bids: Dict[str, float] = {}
+        for sku in skus:
+            cfg = active[f"{camp_id}:{sku}"]
+            margin_pct = cfg.get("margin_pct", 10.0)
+            comp_bid = competitive.get(sku)
+            if not comp_bid:
+                log(f"  {camp_id}/{sku}: нет данных конкурентной ставки — пропуск")
+                continue
+            target_bid = round(comp_bid * (1 + margin_pct / 100), 2)
+            log(f"  {camp_id}/{sku}: конкурентная={comp_bid:.2f}₽, наценка={margin_pct:.0f}%, "
+                f"новая ставка={target_bid:.2f}₽")
+            new_bids[sku] = target_bid
+
+        if not new_bids:
+            continue
+        try:
+            perf.set_bids(camp_id, new_bids)
+            log(f"  Кампания {camp_id}: обновлено ставок — {len(new_bids)}")
+        except Exception as exc:
+            log(f"  Кампания {camp_id}: ОШИБКА установки ставок — {exc}")
+        time.sleep(0.5)
 
 
 # ============================================================================
@@ -2845,6 +2953,7 @@ def load_config() -> Dict[str, Any]:
                    "gemini_api_key": "", "gemini_model": "gemini-2.0-flash"},
             "update": {"days_back": 30, "top_keywords": 15, "target_offer_ids": []},
             "wb_ads": {"step_pct": 10.0, "campaigns": {}},
+            "ozon_ads": {"products": {}},
         }
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -3863,6 +3972,69 @@ class AdsCampaignSettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+class OzonAdsProductSettingsDialog(tk.Toplevel):
+    """Диалог задания наценки над конкурентной ставкой и включения авторегулировки
+    для одного товара в рекламной кампании Ozon."""
+
+    def __init__(self, parent, campaign: Dict[str, Any], sku: str,
+                 competitive_bid: Optional[float], current: Dict[str, Any]):
+        super().__init__(parent)
+        self.title(f"Настройка товара — {sku}")
+        self.geometry("420x240")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.result: Optional[Dict[str, Any]] = None
+        is_manual = campaign.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+
+        bid_line = f"{competitive_bid:.2f}₽" if competitive_bid is not None else "нет данных"
+        info = f"Кампания: {campaign.get('title', '')}\nSKU: {sku}\nКонкурентная ставка: {bid_line}"
+        ttk.Label(self, text=info, wraplength=380, justify="left").pack(padx=14, pady=(14, 8), anchor="w")
+
+        if not is_manual:
+            warn = ttk.Label(self, text="У этой кампании включена автостратегия Ozon "
+                                        "(TARGET_BIDS и т.п.) — вручную заданная ставка "
+                                        "игнорируется. Авторегулировка недоступна.",
+                             foreground="#cc6600", wraplength=380, justify="left")
+            warn.pack(padx=14, pady=(0, 8), anchor="w")
+
+        rf = ttk.Frame(self); rf.pack(padx=14, pady=6, fill="x")
+        ttk.Label(rf, text="Наценка над конкурентом, %:").pack(side="left")
+        self.margin_var = tk.StringVar(value=str(current.get("margin_pct", "") or "10"))
+        ttk.Entry(rf, textvariable=self.margin_var, width=10,
+                 state="normal" if is_manual else "disabled").pack(side="left", padx=8)
+
+        self.enabled_var = tk.BooleanVar(value=bool(current.get("enabled")) and is_manual)
+        ttk.Checkbutton(self, text="Включить авторегулировку ставки для этого товара",
+                       variable=self.enabled_var,
+                       state="normal" if is_manual else "disabled").pack(padx=14, pady=8, anchor="w")
+
+        hint = ttk.Label(self, text="Новая ставка = конкурентная ставка × (1 + наценка/100).\n"
+                                    "Применяется как ставка CPC (за клик) в кампании.",
+                         foreground="gray", wraplength=380, justify="left")
+        hint.pack(padx=14, pady=(0, 8), anchor="w")
+
+        bf = ttk.Frame(self); bf.pack(pady=10)
+        ttk.Button(bf, text="Сохранить", command=self._save, state="normal" if is_manual else "disabled").pack(side="left", padx=6)
+        ttk.Button(bf, text="Отмена", command=self.destroy).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_window()
+
+    def _save(self):
+        raw = self.margin_var.get().strip().replace(",", ".")
+        margin_pct = 10.0
+        if raw:
+            try:
+                margin_pct = float(raw)
+            except ValueError:
+                messagebox.showerror("Ошибка", "Наценка должна быть числом.", parent=self)
+                return
+        self.result = {"margin_pct": margin_pct, "enabled": self.enabled_var.get()}
+        self.destroy()
+
+
 class PreviewDialog(tk.Toplevel):
     """Модальный диалог для сравнения старого и нового описания."""
 
@@ -3971,6 +4143,8 @@ class App(tk.Tk):
         self._prices_stop_event = threading.Event()
         self._ads_stop_event = threading.Event()
         self._ads_campaigns: List[Dict[str, Any]] = []
+        self._ozon_ads_stop_event = threading.Event()
+        self._ozon_ads_products: List[Dict[str, Any]] = []
         self._log_queue: queue.Queue = queue.Queue()
 
         self._setup_logging()
@@ -4142,6 +4316,8 @@ class App(tk.Tk):
         self._build_prices_tab(pf, marketplace="ozon")
         tf = ttk.Frame(nb); nb.add(tf, text="  Товары  ")
         self._build_products_tab(tf, marketplace="ozon")
+        af = ttk.Frame(nb); nb.add(af, text="  Реклама  ")
+        self._build_ozon_ads_tab(af)
 
     def _build_ozon_desc_tab(self, parent: ttk.Frame):
         ttk.Label(parent, text="Обновление описаний товаров Ozon", font=("", 10, "bold")).pack(padx=16, pady=(12, 4), anchor="w")
@@ -4548,6 +4724,202 @@ class App(tk.Tk):
             except Exception as exc:
                 self._ads_log(f"ОШИБКА цикла регулировки: {exc}")
             self._ads_stop_event.wait(300)  # 5 минут, но реагирует на Стоп сразу
+
+    # ─────────────────────── OZON — РЕКЛАМА (АВТО-СТАВКИ) ────────────────
+
+    def _build_ozon_ads_tab(self, parent: ttk.Frame):
+        ttk.Label(parent, text="Автоматическая регулировка ставок по конкурентам",
+                 font=("", 10, "bold")).pack(padx=16, pady=(12, 2), anchor="w")
+        hint = ("Каждые 5 минут скрипт сравнивает вашу ставку с конкурентной ставкой по "
+                "товару (Ozon Performance API) и держит вашу ставку выше на заданный процент. "
+                "Работает только для кампаний БЕЗ автостратегии Ozon (TARGET_BIDS и т.п.) — "
+                "для остальных ставку определяет сам Ozon, и ручное значение игнорируется.\n"
+                "Дважды кликните по товару, чтобы задать наценку и включить авторегулировку.")
+        ttk.Label(parent, text=hint, foreground="gray", wraplength=1000, justify="left").pack(padx=16, anchor="w")
+
+        bf = ttk.Frame(parent); bf.pack(padx=16, pady=8, anchor="w")
+        self.ozon_ads_load_btn = ttk.Button(bf, text="Загрузить кампании и товары",
+                                            command=self._load_ozon_ads_campaigns)
+        self.ozon_ads_load_btn.pack(side="left", padx=4)
+        self.ozon_ads_start_btn = ttk.Button(bf, text="Запустить авторегулировку", command=self._start_ozon_ads_auto)
+        self.ozon_ads_start_btn.pack(side="left", padx=(16, 4))
+        self.ozon_ads_stop_btn = ttk.Button(bf, text="Остановить", command=self._stop_ozon_ads_auto, state="disabled")
+        self.ozon_ads_stop_btn.pack(side="left", padx=4)
+
+        self.ozon_ads_status_label = ttk.Label(parent, text="Нажмите 'Загрузить кампании и товары'", foreground="gray")
+        self.ozon_ads_status_label.pack(padx=16, pady=(0, 4), anchor="w")
+
+        cols = ("campaign", "sku", "strategy", "competitive", "margin", "enabled")
+        heads = ("Кампания", "SKU", "Стратегия", "Конкурентная, ₽", "Наценка, %", "Авто")
+        widths = (220, 110, 140, 120, 90, 60)
+        tf = ttk.Frame(parent); tf.pack(fill="both", expand=True, padx=16, pady=4)
+        vsb = ttk.Scrollbar(tf, orient="vertical")
+        tree = ttk.Treeview(tf, columns=cols, show="headings", yscrollcommand=vsb.set, height=12)
+        vsb.config(command=tree.yview); vsb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        for col, head, w in zip(cols, heads, widths):
+            tree.heading(col, text=head)
+            tree.column(col, width=w, minwidth=40, anchor="center")
+        tree.column("campaign", anchor="w")
+        tree.tag_configure("enabled", foreground="#4caf50")
+        tree.tag_configure("auto", foreground="#888888")
+        tree.bind("<Double-1>", self._on_ozon_ads_dblclick)
+        self.ozon_ads_tree = tree
+
+        lf = ttk.LabelFrame(parent, text="Журнал авторегулировки")
+        lf.pack(fill="both", expand=True, padx=16, pady=6)
+        self.ozon_ads_log_text = scrolledtext.ScrolledText(lf, state="disabled", wrap="word", height=8,
+                                                           font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
+        self.ozon_ads_log_text.pack(fill="both", expand=True, padx=4, pady=4)
+        ttk.Button(lf, text="Очистить", command=lambda: self._clear_tab_log(self.ozon_ads_log_text)).pack(anchor="w", padx=4, pady=2)
+
+    def _ozon_ads_log(self, msg: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        def _append():
+            self.ozon_ads_log_text.config(state="normal")
+            self.ozon_ads_log_text.insert("end", line)
+            self.ozon_ads_log_text.see("end")
+            self.ozon_ads_log_text.config(state="disabled")
+        self.after(0, _append)
+
+    def _load_ozon_ads_campaigns(self):
+        perf_cfg = self.config_data.get("performance", {})
+        if not perf_cfg.get("client_id") or not perf_cfg.get("client_secret"):
+            messagebox.showerror("Реклама Ozon", "Укажите Performance API Client ID/Secret в Настройках.")
+            return
+        self.ozon_ads_load_btn.config(state="disabled")
+        self.ozon_ads_status_label.config(text="Загрузка кампаний и товаров...", foreground="gray")
+        threading.Thread(target=self._load_ozon_ads_campaigns_thread, args=(perf_cfg,), daemon=True).start()
+
+    def _load_ozon_ads_campaigns_thread(self, perf_cfg: Dict[str, Any]):
+        perf = OzonPerformanceClient(perf_cfg.get("client_id", ""), perf_cfg.get("client_secret", ""))
+        try:
+            campaigns = perf.get_campaigns()
+        except Exception as exc:
+            self._ozon_ads_log(f"Ошибка загрузки кампаний: {exc}")
+            self.after(0, lambda: (
+                self.ozon_ads_status_label.config(text=f"Ошибка: {exc}", foreground="red"),
+                self.ozon_ads_load_btn.config(state="normal"),
+            ))
+            return
+
+        rows: List[Dict[str, Any]] = []  # {campaign, sku, competitive_bid}
+        for camp in campaigns:
+            camp_id = str(camp.get("id", ""))
+            if not camp_id or camp.get("advObjectType") != "SKU":
+                continue
+            try:
+                skus = perf.get_campaign_products(camp_id)
+            except Exception as exc:
+                self._ozon_ads_log(f"  Кампания {camp.get('title')}: ошибка получения товаров — {exc}")
+                continue
+            if not skus:
+                continue
+            is_manual = camp.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+            competitive: Dict[str, float] = {}
+            if is_manual:
+                # Конкурентные ставки запрашиваем только там, где авторегулировка вообще
+                # возможна — экономим запросы для кампаний на автопилоте, где это не нужно
+                try:
+                    competitive = perf.get_competitive_bids(camp_id, skus)
+                except Exception as exc:
+                    self._ozon_ads_log(f"  Кампания {camp.get('title')}: ошибка конкурентных ставок — {exc}")
+            for sku in skus:
+                rows.append({"campaign": camp, "sku": sku, "competitive_bid": competitive.get(sku)})
+            time.sleep(0.3)
+
+        self._ozon_ads_products = rows
+        products_cfg = self.config_data.get("ozon_ads", {}).get("products", {})
+
+        def _fill():
+            tree = self.ozon_ads_tree
+            tree.delete(*tree.get_children())
+            for r in rows:
+                camp = r["campaign"]
+                camp_id = str(camp.get("id"))
+                sku = r["sku"]
+                key = f"{camp_id}:{sku}"
+                is_manual = camp.get("productAutopilotStrategy") == OZON_ADS_MANUAL_STRATEGY
+                cfg = products_cfg.get(key, {})
+                enabled = bool(cfg.get("enabled")) and is_manual
+                margin = cfg.get("margin_pct")
+                comp_bid = r["competitive_bid"]
+                strategy_label = "ручная" if is_manual else "автопилот Ozon"
+                tree.insert("", "end", iid=key, values=(
+                    camp.get("title", camp_id), sku, strategy_label,
+                    f"{comp_bid:.2f}" if comp_bid is not None else "—",
+                    f"{margin:.0f}" if margin else "—",
+                    "Да" if enabled else "Нет",
+                ), tags=("enabled",) if enabled else (("auto",) if not is_manual else ()))
+            self.ozon_ads_status_label.config(text=f"Товаров: {len(rows)}", foreground="black")
+            self.ozon_ads_load_btn.config(state="normal")
+        self.after(0, _fill)
+
+    def _on_ozon_ads_dblclick(self, event):
+        item = self.ozon_ads_tree.identify_row(event.y)
+        if not item:
+            return
+        row = next((r for r in self._ozon_ads_products
+                   if f"{r['campaign'].get('id')}:{r['sku']}" == item), None)
+        if not row:
+            return
+        products_cfg = self.config_data.setdefault("ozon_ads", {}).setdefault("products", {})
+        current = products_cfg.get(item, {})
+        dlg = OzonAdsProductSettingsDialog(self, row["campaign"], row["sku"], row["competitive_bid"], current)
+        if dlg.result is None:
+            return
+        products_cfg[item] = dlg.result
+        self._save_ozon_ads_settings()
+        self._load_ozon_ads_campaigns()
+
+    def _save_ozon_ads_settings(self):
+        cfg = dict(self.config_data)
+        cfg["ozon_ads"] = dict(cfg.get("ozon_ads", {}))
+        save_config(cfg)
+        self.config_data = cfg
+
+    def _start_ozon_ads_auto(self):
+        perf_cfg = self.config_data.get("performance", {})
+        if not perf_cfg.get("client_id") or not perf_cfg.get("client_secret"):
+            messagebox.showerror("Реклама Ozon", "Укажите Performance API Client ID/Secret в Настройках.")
+            return
+        products_cfg = self.config_data.get("ozon_ads", {}).get("products", {})
+        if not any(p.get("enabled") for p in products_cfg.values()):
+            messagebox.showinfo("Реклама Ozon",
+                               "Нет товаров с включённой авторегулировкой. "
+                               "Дважды кликните по товару в списке, чтобы включить (доступно "
+                               "только для кампаний без автостратегии Ozon).")
+            return
+        if not messagebox.askyesno(
+            "Подтверждение",
+            "Каждые 5 минут ставка на включённых товарах будет автоматически подстраиваться "
+            "под конкурентную ставку с заданной наценкой. Изменения применяются сразу к живым "
+            "кампаниям, без предварительного подтверждения каждого шага. Запустить?"
+        ):
+            return
+        self._ozon_ads_stop_event.clear()
+        self.ozon_ads_start_btn.config(state="disabled")
+        self.ozon_ads_stop_btn.config(state="normal")
+        self._ozon_ads_log("Автоматическая регулировка ставок запущена (проверка каждые 5 минут)")
+        threading.Thread(target=self._ozon_ads_loop, daemon=True).start()
+
+    def _stop_ozon_ads_auto(self):
+        self._ozon_ads_stop_event.set()
+        self.ozon_ads_start_btn.config(state="normal")
+        self.ozon_ads_stop_btn.config(state="disabled")
+        self._ozon_ads_log("Остановлено пользователем")
+
+    def _ozon_ads_loop(self):
+        perf_cfg = self.config_data.get("performance", {})
+        perf = OzonPerformanceClient(perf_cfg.get("client_id", ""), perf_cfg.get("client_secret", ""))
+        while not self._ozon_ads_stop_event.is_set():
+            products_cfg = self.config_data.get("ozon_ads", {}).get("products", {})
+            try:
+                run_ozon_ads_cycle(perf, products_cfg, log_fn=self._ozon_ads_log)
+            except Exception as exc:
+                self._ozon_ads_log(f"ОШИБКА цикла регулировки: {exc}")
+            self._ozon_ads_stop_event.wait(300)  # 5 минут, но реагирует на Стоп сразу
 
     def _on_product_dblclick(self, event, marketplace: str, tree: ttk.Treeview):
         item = tree.identify_row(event.y)
