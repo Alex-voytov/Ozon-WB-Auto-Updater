@@ -1235,6 +1235,85 @@ def find_keywords_via_ai(api_key: str, product_name: str, marketplace_name: str,
         return []
 
 
+def find_competitors_via_gemini(api_key: str, keyword: str, marketplace_name: str,
+                                top_n: int = 3, model: str = "gemini-2.5-flash") -> List[Dict[str, str]]:
+    """Ищет карточки товаров-конкурентов через веб-поиск Gemini (Google Search grounding).
+    Аналог find_competitors_via_ai, но для провайдера Gemini — используется, когда в качестве
+    основного генератора выбран Gemini, чтобы не зависеть от отдельного ключа/баланса Anthropic."""
+    if not api_key:
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"Используя веб-поиск, найди {top_n} реальные карточки товаров-конкурентов на {marketplace_name} "
+            f"по запросу «{keyword}». Для каждого найденного товара составь краткое связное описание "
+            f"(300-700 символов), опираясь на реальный текст со страницы товара конкурента, а не выдумывай.\n\n"
+            f"Верни ТОЛЬКО JSON-массив без пояснений до или после, в формате:\n"
+            f'[{{"name": "название товара", "description": "текст описания"}}, ...]'
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
+        )
+        text = (resp.text or "").strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            logging.info(f"[Gemini AI competitors '{keyword}'] JSON не найден в ответе")
+            return []
+        data = json.loads(match.group(0))
+        result: List[Dict[str, str]] = []
+        for item in data[:top_n]:
+            name = str(item.get("name", "")).strip()
+            desc = str(item.get("description", "")).strip()
+            if name and desc:
+                result.append({"name": name, "description": desc[:1200]})
+        logging.info(f"[Gemini AI competitors '{keyword}'] найдено: {len(result)}")
+        return result
+    except Exception as exc:
+        logging.info(f"[Gemini AI competitors '{keyword}'] ошибка: {exc}")
+        return []
+
+
+def find_keywords_via_gemini(api_key: str, product_name: str, marketplace_name: str,
+                             top_n: int = 15, model: str = "gemini-2.5-flash") -> List[str]:
+    """Ищет реальные поисковые запросы покупателей через веб-поиск Gemini (Google Search grounding).
+    Аналог find_keywords_via_ai, но для провайдера Gemini."""
+    if not api_key:
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"Используя веб-поиск, изучи реальные карточки товара «{product_name}» и похожих на него "
+            f"товаров на {marketplace_name} — их заголовки, описания и SEO-ключи. На основе этого "
+            f"определи {top_n} реальных поисковых запросов и ключевых слов, по которым покупатели "
+            f"ищут такие товары на маркетплейсе.\n\n"
+            f"Верни ТОЛЬКО JSON-массив строк без пояснений, от самых частотных запросов к менее частотным:\n"
+            f'["запрос 1", "запрос 2", ...]'
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
+        )
+        text = (resp.text or "").strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            logging.info(f"[Gemini AI keywords '{product_name}'] JSON не найден в ответе")
+            return []
+        data = json.loads(match.group(0))
+        result = [str(kw).strip().lower() for kw in data if str(kw).strip()]
+        logging.info(f"[Gemini AI keywords '{product_name}'] найдено: {len(result)}")
+        return result[:top_n]
+    except Exception as exc:
+        logging.info(f"[Gemini AI keywords '{product_name}'] ошибка: {exc}")
+        return []
+
+
 # ============================================================================
 # КЛИЕНТ OZON PERFORMANCE API
 # ============================================================================
@@ -2138,7 +2217,8 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
                         days_back: int = 30, top_keywords: int = 15,
                         log_fn=None, confirm_fn=None,
                         mpstats: "MpstatsClient | None" = None,
-                        anthropic_api_key: str = "", anthropic_model: str = "claude-opus-4-8") -> str:
+                        anthropic_api_key: str = "", anthropic_model: str = "claude-opus-4-8",
+                        gemini_api_key: str = "", gemini_model: str = "gemini-2.0-flash") -> str:
     """
     Возвращает: "ok" | "skipped" | "error" | "skip_all" | "apply_all"
     confirm_fn(offer_id, name, old_desc, new_desc) -> "apply"|"skip"|"apply_all"|"skip_all"
@@ -2146,6 +2226,13 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
     def log(msg):
         if log_fn:
             log_fn(msg)
+
+    # Веб-поиск ключевых слов/конкурентов делаем тем же провайдером, что выбран для
+    # генерации — чтобы не зависеть от ключа/баланса другого провайдера, которым
+    # пользователь мог и не пользоваться
+    use_gemini_search = isinstance(generator, GeminiDescriptionGenerator)
+    ai_search_key = gemini_api_key if use_gemini_search else anthropic_api_key
+    ai_search_name = "Gemini" if use_gemini_search else "Claude"
 
     try:
         log(f"{'=' * 50}")
@@ -2168,13 +2255,17 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
         log(f"  Главное ключевое слово: «{main_kw}»")
 
         # 2. Если аналитики по SKU ещё нет (новый товар без истории показов) —
-        # ищем реальные запросы покупателей через веб-поиск Claude
-        if not keywords and anthropic_api_key:
-            log("  Аналитики по SKU нет — ищем ключевые слова через веб-поиск Claude...")
-            keywords = find_keywords_via_ai(anthropic_api_key, snapshot.name, "Ozon",
-                                            top_n=top_keywords, model=anthropic_model)
+        # ищем реальные запросы покупателей через веб-поиск (тем же провайдером, что и генерация)
+        if not keywords and ai_search_key:
+            log(f"  Аналитики по SKU нет — ищем ключевые слова через веб-поиск {ai_search_name}...")
+            if use_gemini_search:
+                keywords = find_keywords_via_gemini(ai_search_key, snapshot.name, "Ozon",
+                                                    top_n=top_keywords, model=gemini_model)
+            else:
+                keywords = find_keywords_via_ai(ai_search_key, snapshot.name, "Ozon",
+                                                top_n=top_keywords, model=anthropic_model)
             if keywords:
-                log(f"  Найдено через Claude: {len(keywords)} запросов")
+                log(f"  Найдено через {ai_search_name}: {len(keywords)} запросов")
 
         # 3. Последний резерв — извлечение слов из названия товара
         if not keywords:
@@ -2197,12 +2288,16 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
             competitors = fetch_ozon_competitors(competitor_kw, top_n=3)
             if competitors:
                 log(f"  Конкуренты: найдено {len(competitors)} карточек")
-            elif anthropic_api_key:
-                log("  Прямой доступ заблокирован — ищем конкурентов через веб-поиск Claude...")
-                competitors = find_competitors_via_ai(anthropic_api_key, competitor_kw, "Ozon",
-                                                      top_n=3, model=anthropic_model)
+            elif ai_search_key:
+                log(f"  Прямой доступ заблокирован — ищем конкурентов через веб-поиск {ai_search_name}...")
+                if use_gemini_search:
+                    competitors = find_competitors_via_gemini(ai_search_key, competitor_kw, "Ozon",
+                                                              top_n=3, model=gemini_model)
+                else:
+                    competitors = find_competitors_via_ai(ai_search_key, competitor_kw, "Ozon",
+                                                          top_n=3, model=anthropic_model)
                 if competitors:
-                    log(f"  Конкуренты (через Claude): найдено {len(competitors)} карточек")
+                    log(f"  Конкуренты (через {ai_search_name}): найдено {len(competitors)} карточек")
                 else:
                     log("  Конкуренты: не найдено")
             else:
@@ -2311,7 +2406,8 @@ def update_product_card(ozon: OzonClient, generator, offer_id: str,
 def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
                            log_fn=None, confirm_fn=None,
                            mpstats: "MpstatsClient | None" = None,
-                           anthropic_api_key: str = "", anthropic_model: str = "claude-opus-4-8") -> str:
+                           anthropic_api_key: str = "", anthropic_model: str = "claude-opus-4-8",
+                           gemini_api_key: str = "", gemini_model: str = "gemini-2.0-flash") -> str:
     """
     Обновляет описание одной карточки WB.
     Возвращает: "ok" | "skipped" | "error" | "skip_all" | "apply_all"
@@ -2319,6 +2415,13 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
     def log(msg):
         if log_fn:
             log_fn(msg)
+
+    # Веб-поиск ключевых слов/конкурентов делаем тем же провайдером, что выбран для
+    # генерации — чтобы не зависеть от ключа/баланса другого провайдера, которым
+    # пользователь мог и не пользоваться
+    use_gemini_search = isinstance(generator, GeminiDescriptionGenerator)
+    ai_search_key = gemini_api_key if use_gemini_search else anthropic_api_key
+    ai_search_name = "Gemini" if use_gemini_search else "Claude"
 
     try:
         vendor_code = card.get("vendorCode") or card.get("nmID", "?")
@@ -2344,13 +2447,17 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
             except Exception as exc:
                 log(f"  MPStats ошибка: {exc}")
 
-        # Если данных MPStats нет — ищем реальные запросы через веб-поиск Claude
-        if not keywords and anthropic_api_key:
-            log("  Данных MPStats нет — ищем ключевые слова через веб-поиск Claude...")
-            keywords = find_keywords_via_ai(anthropic_api_key, product_name, "Wildberries",
-                                            top_n=15, model=anthropic_model)
+        # Если данных MPStats нет — ищем реальные запросы через веб-поиск (тем же провайдером, что и генерация)
+        if not keywords and ai_search_key:
+            log(f"  Данных MPStats нет — ищем ключевые слова через веб-поиск {ai_search_name}...")
+            if use_gemini_search:
+                keywords = find_keywords_via_gemini(ai_search_key, product_name, "Wildberries",
+                                                    top_n=15, model=gemini_model)
+            else:
+                keywords = find_keywords_via_ai(ai_search_key, product_name, "Wildberries",
+                                                top_n=15, model=anthropic_model)
             if keywords:
-                log(f"  Найдено через Claude: {len(keywords)} запросов")
+                log(f"  Найдено через {ai_search_name}: {len(keywords)} запросов")
 
         # Последний резерв — извлечение слов из названия товара
         if not keywords:
@@ -2372,12 +2479,16 @@ def update_wb_product_card(wb: WbClient, generator, card: Dict[str, Any],
             competitors = fetch_wb_competitors(competitor_kw, top_n=3)
             if competitors:
                 log(f"  Конкуренты: найдено {len(competitors)} карточек")
-            elif anthropic_api_key:
-                log("  Прямой доступ заблокирован — ищем конкурентов через веб-поиск Claude...")
-                competitors = find_competitors_via_ai(anthropic_api_key, competitor_kw, "Wildberries",
-                                                      top_n=3, model=anthropic_model)
+            elif ai_search_key:
+                log(f"  Прямой доступ заблокирован — ищем конкурентов через веб-поиск {ai_search_name}...")
+                if use_gemini_search:
+                    competitors = find_competitors_via_gemini(ai_search_key, competitor_kw, "Wildberries",
+                                                              top_n=3, model=gemini_model)
+                else:
+                    competitors = find_competitors_via_ai(ai_search_key, competitor_kw, "Wildberries",
+                                                          top_n=3, model=anthropic_model)
                 if competitors:
-                    log(f"  Конкуренты (через Claude): найдено {len(competitors)} карточек")
+                    log(f"  Конкуренты (через {ai_search_name}): найдено {len(competitors)} карточек")
                 else:
                     log("  Конкуренты: не найдено")
             else:
@@ -4637,7 +4748,9 @@ class App(tk.Tk):
                                          log_fn=self._log, confirm_fn=confirm_fn,
                                          mpstats=mpstats_client,
                                          anthropic_api_key=cfg.get("ai", {}).get("anthropic_api_key", ""),
-                                         anthropic_model=cfg.get("ai", {}).get("model", "claude-opus-4-8"))
+                                         anthropic_model=cfg.get("ai", {}).get("model", "claude-opus-4-8"),
+                                         gemini_api_key=cfg.get("ai", {}).get("gemini_api_key", ""),
+                                         gemini_model=cfg.get("ai", {}).get("gemini_model", "gemini-2.0-flash"))
             if result == "ok": success += 1
             elif result == "apply_all": success += 1; auto_apply = True
             elif result in ("skip", "skipped"): skipped += 1
@@ -4766,7 +4879,9 @@ class App(tk.Tk):
             result = update_wb_product_card(wb, generator, card, log_fn=self._wb_log,
                                             confirm_fn=confirm_fn, mpstats=mpstats_client,
                                             anthropic_api_key=ai_cfg.get("anthropic_api_key", ""),
-                                            anthropic_model=ai_cfg.get("model", "claude-opus-4-8"))
+                                            anthropic_model=ai_cfg.get("model", "claude-opus-4-8"),
+                                            gemini_api_key=ai_cfg.get("gemini_api_key", ""),
+                                            gemini_model=ai_cfg.get("gemini_model", "gemini-2.0-flash"))
             if result == "ok": success += 1
             elif result == "apply_all": success += 1; auto_apply = True
             elif result in ("skip", "skipped"): skipped += 1
