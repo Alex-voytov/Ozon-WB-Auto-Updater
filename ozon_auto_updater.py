@@ -1737,9 +1737,10 @@ def run_ozon_ads_cycle(perf: OzonPerformanceClient, products_cfg: Dict[str, Dict
     log(f"{'=' * 50}")
     log(f"Проверка ставок Ozon — {datetime.datetime.now().strftime('%H:%M:%S')}")
 
-    active = {k: v for k, v in products_cfg.items() if v.get("enabled")}
+    active = {k: v for k, v in products_cfg.items()
+             if v.get("enabled") and v.get("mode", "margin") != "position"}
     if not active:
-        log("  Нет товаров с включённой авторегулировкой")
+        log("  Нет товаров с включённой авторегулировкой по наценке")
         return
 
     by_campaign: Dict[str, List[str]] = {}
@@ -1775,6 +1776,236 @@ def run_ozon_ads_cycle(perf: OzonPerformanceClient, products_cfg: Dict[str, Dict
             log(f"  Кампания {camp_id}: обновлено ставок — {len(new_bids)}")
         except Exception as exc:
             log(f"  Кампания {camp_id}: ОШИБКА установки ставок — {exc}")
+        time.sleep(0.5)
+
+
+# ============================================================================
+# OZON — ВИДИМОСТЬ В ПОИСКЕ (скрейпинг браузером, официального API нет)
+# ============================================================================
+
+OZON_SELLER_BASE = "https://seller.ozon.ru"
+OZON_VISIBILITY_PATH = "/app/analytics/what-to-sell/competitive-position"
+OZON_BROWSER_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ozon_browser_profile")
+OZON_POSITION_DEADBAND = 2  # позиций — в этих пределах ставку не трогаем
+
+
+class OzonVisibilityError(RuntimeError):
+    pass
+
+
+def _ozon_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise OzonVisibilityError(
+            "Для регулировки по позиции нужен пакет playwright: выполните "
+            "`pip install playwright` и `playwright install chromium`."
+        ) from exc
+    return sync_playwright
+
+
+class OzonVisibilityScraper:
+    """Читает страницу «Аналитика → Видимость в поиске» в личном кабинете seller.ozon.ru.
+    Официального API для этих данных Ozon не публикует, поэтому используется тот же
+    браузерный профиль, в который пользователь один раз входит вручную (см.
+    ensure_logged_in) — логин/пароль скрипт не видит, только сохранённые куки сессии.
+
+    Таблица разбирается по тексту заголовков колонок, а не по хэшированным CSS-классам
+    Ozon (они меняются при каждом релизе фронтенда) — это не защищает от изменения самой
+    структуры страницы, но переживёт обычный редеплой со сборкой."""
+
+    def __init__(self, headless: bool = True, timeout_ms: int = 30000):
+        self.headless = headless
+        self.timeout_ms = timeout_ms
+
+    def ensure_logged_in(self) -> bool:
+        """Открывает видимое окно браузера и ждёт, пока пользователь сам не войдёт
+        в аккаунт (до 10 минут). Сессия сохраняется в постоянном профиле на диске."""
+        sync_playwright = _ozon_playwright()
+        os.makedirs(OZON_BROWSER_PROFILE_DIR, exist_ok=True)
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(OZON_BROWSER_PROFILE_DIR, headless=False)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(f"{OZON_SELLER_BASE}{OZON_VISIBILITY_PATH}",
+                         wait_until="domcontentloaded", timeout=self.timeout_ms)
+                try:
+                    page.get_by_label("Поисковый запрос").wait_for(timeout=600000)
+                    return True
+                except Exception:
+                    return False
+            finally:
+                context.close()
+
+    def get_visibility_batch(self, queries: List[str], max_pages: int = 1) -> Dict[str, List[Dict[str, Any]]]:
+        """Возвращает {запрос: [строки таблицы]} для всех переданных запросов за один
+        запуск браузера. Строка: {position, name, sku, is_own, score, status,
+        cpc_value, cpc_label}."""
+        sync_playwright = _ozon_playwright()
+        if not os.path.isdir(OZON_BROWSER_PROFILE_DIR):
+            raise OzonVisibilityError(
+                "Браузерный профиль Ozon не найден — сначала выполните вход "
+                "(кнопка «Войти в аккаунт Ozon» на вкладке Реклама)."
+            )
+        results: Dict[str, List[Dict[str, Any]]] = {}
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(OZON_BROWSER_PROFILE_DIR, headless=self.headless)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(f"{OZON_SELLER_BASE}{OZON_VISIBILITY_PATH}",
+                         wait_until="domcontentloaded", timeout=self.timeout_ms)
+                try:
+                    page.get_by_label("Поисковый запрос").wait_for(timeout=self.timeout_ms)
+                except Exception as exc:
+                    raise OzonVisibilityError(
+                        "Не удалось открыть «Видимость в поиске» — возможно, истекла "
+                        "сессия входа. Войдите заново."
+                    ) from exc
+                for query in queries:
+                    try:
+                        results[query] = self._search_one(page, query, max_pages)
+                    except Exception:
+                        results[query] = []
+            finally:
+                context.close()
+        return results
+
+    def _search_one(self, page, query: str, max_pages: int) -> List[Dict[str, Any]]:
+        box = page.get_by_label("Поисковый запрос")
+        box.fill(query)
+        page.get_by_role("button", name="Показать результаты").click()
+        page.get_by_text(f"по запросу «{query}»").wait_for(timeout=self.timeout_ms)
+        page.wait_for_timeout(1200)
+        rows = self._parse_table(page)
+        for page_num in range(2, max_pages + 1):
+            btn = page.get_by_role("button", name=str(page_num), exact=True)
+            if btn.count() == 0:
+                break
+            btn.click()
+            page.wait_for_timeout(1000)
+            rows.extend(self._parse_table(page))
+        return rows
+
+    def _parse_table(self, page) -> List[Dict[str, Any]]:
+        table = page.query_selector("table")
+        if not table:
+            raise OzonVisibilityError("Таблица результатов не найдена на странице.")
+        header2 = [th.inner_text().strip() for th in table.query_selector_all("thead tr:nth-child(2) th")]
+        if len(header2) < 9:
+            raise OzonVisibilityError("Структура таблицы «Видимость в поиске» изменилась "
+                                      f"(ожидалось 9 заголовков во 2-й строке, получено {len(header2)}).")
+        columns = ["Позиция", "Название", "Сводная оценка"] + header2[:3] + header2[3:6] \
+                 + ["Популярность общая"] + header2[6:9]
+        rows_out: List[Dict[str, Any]] = []
+        for tr in table.query_selector_all("tbody > tr"):
+            tds = tr.query_selector_all(":scope > td")
+            if len(tds) < len(columns):
+                continue
+            cells = {col: tds[i].inner_text().strip() for i, col in enumerate(columns)}
+            rows_out.append(self._row_from_cells(cells))
+        return rows_out
+
+    @staticmethod
+    def _row_from_cells(cells: Dict[str, str]) -> Dict[str, Any]:
+        pos_text = cells.get("Позиция", "").replace(" ", "").strip()
+        position = int(pos_text) if pos_text.isdigit() else None
+
+        name_block = cells.get("Название", "")
+        sku_match = re.search(r"SKU[\s ]*(\d+)", name_block)
+        sku = sku_match.group(1) if sku_match else ""
+        is_own = "Мой товар" in name_block
+        name = name_block.split("\n")[0].strip()
+
+        score_text = cells.get("Сводная оценка", "").replace(" ", "").replace(",", ".").strip()
+        score = float(score_text) if re.fullmatch(r"\d+(\.\d+)?", score_text) else None
+
+        cpc_value, cpc_label = OzonVisibilityScraper._parse_bid_cell(cells.get("Ставка Оплата за клик", ""))
+
+        return {
+            "position": position, "name": name, "sku": sku, "is_own": is_own,
+            "score": score, "status": cells.get("Статус", ""),
+            "cpc_value": cpc_value, "cpc_label": cpc_label,
+        }
+
+    @staticmethod
+    def _parse_bid_cell(raw: str):
+        lines = [l.strip() for l in raw.split("\n") if l.strip()]
+        if not lines or lines[0] in ("—", "Выключено", "Не в аукционе"):
+            return None, (lines[0] if lines else "—")
+        m = re.search(r"([\d\s ]+(?:[.,]\d+)?)\s*₽", lines[0])
+        if not m:
+            return None, lines[0]
+        digits = re.sub(r"[\s ]", "", m.group(1)).replace(",", ".")
+        try:
+            value = float(digits)
+        except ValueError:
+            return None, lines[0]
+        return value, (lines[1] if len(lines) > 1 else "")
+
+
+def run_ozon_position_cycle(perf: OzonPerformanceClient, scraper: OzonVisibilityScraper,
+                            products_cfg: Dict[str, Dict[str, Any]], step_pct: float,
+                            save_fn=None, log_fn=None) -> None:
+    """Проход по товарам с режимом «целевая позиция»: сравнивает текущее место в
+    «Видимость в поиске» (браузерный скрейпинг) с желаемым и подстраивает ставку CPC
+    на step_pct — тот же дедбанд-подход, что и в остальных циклах регулировки ставок.
+    products_cfg: "<campaignId>:<sku>" -> {"mode": "position", "query": str,
+    "target_position": int, "enabled": bool, "last_bid": float}."""
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+
+    active = {k: v for k, v in products_cfg.items()
+             if v.get("enabled") and v.get("mode") == "position" and v.get("query")}
+    if not active:
+        return
+
+    log(f"{'=' * 50}")
+    log(f"Проверка позиций в поиске Ozon — {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+    queries = sorted({cfg["query"] for cfg in active.values()})
+    max_pages = 1
+    for cfg in active.values():
+        max_pages = max(max_pages, -(-int(cfg.get("target_position", 10)) // 36))
+    try:
+        results = scraper.get_visibility_batch(queries, max_pages=min(max_pages, 5))
+    except Exception as exc:
+        log(f"  ОШИБКА получения данных «Видимость в поиске»: {exc}")
+        return
+
+    for key, cfg in active.items():
+        camp_id, _, sku = key.partition(":")
+        query = cfg["query"]
+        target_pos = int(cfg.get("target_position", 10))
+        own_row = next((r for r in results.get(query, [])
+                        if r.get("is_own") and r.get("sku") == sku), None)
+
+        current_bid = (own_row.get("cpc_value") if own_row else None) \
+            or cfg.get("last_bid") or cfg.get("start_bid", 5.0)
+        current_pos = own_row.get("position") if own_row else None
+
+        pos_label = str(current_pos) if current_pos is not None else "не найден в выдаче"
+        log(f"  {camp_id}/{sku} («{query}»): позиция={pos_label} (цель {target_pos}), "
+            f"текущая ставка={current_bid:.2f}₽")
+
+        if current_pos is None or current_pos > target_pos + OZON_POSITION_DEADBAND:
+            new_bid = round(current_bid * (1 + step_pct / 100), 2)
+            direction = "не найден — повышаем" if current_pos is None else "хуже цели — повышаем"
+        elif current_pos < target_pos - OZON_POSITION_DEADBAND:
+            new_bid = round(current_bid * (1 - step_pct / 100), 2)
+            direction = "лучше цели — понижаем"
+        else:
+            log(f"  {camp_id}/{sku}: позиция в пределах цели — ставку не меняем")
+            continue
+
+        try:
+            perf.set_bids(camp_id, {sku: new_bid})
+            log(f"  {camp_id}/{sku}: {direction}, {current_bid:.2f}₽ → {new_bid:.2f}₽")
+            cfg["last_bid"] = new_bid
+            if save_fn:
+                save_fn()
+        except Exception as exc:
+            log(f"  {camp_id}/{sku}: ОШИБКА установки ставки — {exc}")
         time.sleep(0.5)
 
 
@@ -2966,7 +3197,7 @@ def load_config() -> Dict[str, Any]:
                    "gemini_api_key": "", "gemini_model": "gemini-2.0-flash"},
             "update": {"days_back": 30, "top_keywords": 15, "target_offer_ids": []},
             "wb_ads": {"step_pct": 10.0, "campaigns": {}},
-            "ozon_ads": {"products": {}},
+            "ozon_ads": {"products": {}, "step_pct": 10.0},
         }
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
