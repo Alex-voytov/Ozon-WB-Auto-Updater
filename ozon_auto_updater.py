@@ -4217,24 +4217,25 @@ class AdsCampaignSettingsDialog(tk.Toplevel):
 
 
 class OzonAdsProductSettingsDialog(tk.Toplevel):
-    """Диалог задания наценки над конкурентной ставкой и включения авторегулировки
-    для одного товара в рекламной кампании Ozon."""
+    """Диалог настройки авторегулировки ставки для одного товара в рекламной кампании
+    Ozon: либо наценка над конкурентной ставкой (Performance API), либо целевая позиция
+    в «Видимость в поиске» (браузерный скрейпинг, требует входа в аккаунт Ozon)."""
 
     def __init__(self, parent, campaign: Dict[str, Any], sku: str,
                  competitive_bid: Optional[float], current: Dict[str, Any]):
         super().__init__(parent)
         self.title(f"Настройка товара — {sku}")
-        self.geometry("420x240")
+        self.geometry("460x460")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
         self.result: Optional[Dict[str, Any]] = None
-        is_manual = _ozon_campaign_bid_editable(campaign)
+        self._is_manual = is_manual = _ozon_campaign_bid_editable(campaign)
 
         bid_line = f"{competitive_bid:.2f}₽" if competitive_bid is not None else "нет данных"
-        info = f"Кампания: {campaign.get('title', '')}\nSKU: {sku}\nКонкурентная ставка: {bid_line}"
-        ttk.Label(self, text=info, wraplength=380, justify="left").pack(padx=14, pady=(14, 8), anchor="w")
+        info = f"Кампания: {campaign.get('title', '')}\nSKU: {sku}\nКонкурентная ставка (API): {bid_line}"
+        ttk.Label(self, text=info, wraplength=420, justify="left").pack(padx=14, pady=(14, 8), anchor="w")
 
         if not is_manual:
             reason = ("включён автопилот Ozon — вручную заданная ставка игнорируется"
@@ -4242,42 +4243,89 @@ class OzonAdsProductSettingsDialog(tk.Toplevel):
                      else "это не обычная товарная CPC-кампания (баннер или «Оплата за заказ») — "
                           "ставка для неё настраивается иначе")
             warn = ttk.Label(self, text=f"Авторегулировка недоступна: {reason}.",
-                             foreground="#cc6600", wraplength=380, justify="left")
+                             foreground="#cc6600", wraplength=420, justify="left")
             warn.pack(padx=14, pady=(0, 8), anchor="w")
 
-        rf = ttk.Frame(self); rf.pack(padx=14, pady=6, fill="x")
-        ttk.Label(rf, text="Наценка над конкурентом, %:").pack(side="left")
+        state = "normal" if is_manual else "disabled"
+        self.mode_var = tk.StringVar(value=current.get("mode", "margin"))
+
+        mf = ttk.LabelFrame(self, text="  Способ регулировки  ")
+        mf.pack(padx=14, pady=6, fill="x")
+        ttk.Radiobutton(mf, text="Наценка над конкурентной ставкой (API)", variable=self.mode_var,
+                       value="margin", state=state, command=self._on_mode_change).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Radiobutton(mf, text="Целевая позиция в «Видимость в поиске»", variable=self.mode_var,
+                       value="position", state=state, command=self._on_mode_change).pack(anchor="w", padx=8, pady=(2, 6))
+
+        margin_f = ttk.Frame(self); margin_f.pack(padx=14, pady=4, fill="x")
+        ttk.Label(margin_f, text="Наценка над конкурентом, %:").pack(side="left")
         self.margin_var = tk.StringVar(value=str(current.get("margin_pct", "") or "10"))
-        ttk.Entry(rf, textvariable=self.margin_var, width=10,
-                 state="normal" if is_manual else "disabled").pack(side="left", padx=8)
+        self.margin_entry = ttk.Entry(margin_f, textvariable=self.margin_var, width=10)
+        self.margin_entry.pack(side="left", padx=8)
+
+        pos_f = ttk.Frame(self); pos_f.pack(padx=14, pady=4, fill="x")
+        ttk.Label(pos_f, text="Поисковый запрос:").pack(side="left")
+        self.query_var = tk.StringVar(value=current.get("query", ""))
+        self.query_entry = ttk.Entry(pos_f, textvariable=self.query_var, width=24)
+        self.query_entry.pack(side="left", padx=8)
+
+        pos2_f = ttk.Frame(self); pos2_f.pack(padx=14, pady=4, fill="x")
+        ttk.Label(pos2_f, text="Целевая позиция в поиске:").pack(side="left")
+        self.target_position_var = tk.StringVar(value=str(current.get("target_position", "") or "10"))
+        self.target_position_entry = ttk.Entry(pos2_f, textvariable=self.target_position_var, width=10)
+        self.target_position_entry.pack(side="left", padx=8)
 
         self.enabled_var = tk.BooleanVar(value=bool(current.get("enabled")) and is_manual)
         ttk.Checkbutton(self, text="Включить авторегулировку ставки для этого товара",
-                       variable=self.enabled_var,
-                       state="normal" if is_manual else "disabled").pack(padx=14, pady=8, anchor="w")
+                       variable=self.enabled_var, state=state).pack(padx=14, pady=8, anchor="w")
 
-        hint = ttk.Label(self, text="Новая ставка = конкурентная ставка × (1 + наценка/100).\n"
-                                    "Применяется как ставка CPC (за клик) в кампании.",
-                         foreground="gray", wraplength=380, justify="left")
-        hint.pack(padx=14, pady=(0, 8), anchor="w")
+        self.hint_label = ttk.Label(self, text="", foreground="gray", wraplength=420, justify="left")
+        self.hint_label.pack(padx=14, pady=(0, 8), anchor="w")
 
         bf = ttk.Frame(self); bf.pack(pady=10)
-        ttk.Button(bf, text="Сохранить", command=self._save, state="normal" if is_manual else "disabled").pack(side="left", padx=6)
+        ttk.Button(bf, text="Сохранить", command=self._save, state=state).pack(side="left", padx=6)
         ttk.Button(bf, text="Отмена", command=self.destroy).pack(side="left", padx=6)
 
+        self._on_mode_change()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.wait_window()
 
+    def _on_mode_change(self):
+        is_margin = self.mode_var.get() == "margin"
+        self.margin_entry.config(state="normal" if (is_margin and self._is_manual) else "disabled")
+        pos_state = "normal" if (not is_margin and self._is_manual) else "disabled"
+        self.query_entry.config(state=pos_state)
+        self.target_position_entry.config(state=pos_state)
+        if is_margin:
+            self.hint_label.config(text="Новая ставка = конкурентная ставка (API) × (1 + наценка/100).\n"
+                                        "Применяется как ставка CPC (за клик) в кампании.")
+        else:
+            self.hint_label.config(text="Каждый цикл сверяет текущее место товара в «Видимость в поиске» "
+                                        "по этому запросу с целевым и шагом меняет ставку CPC вверх/вниз. "
+                                        "Требует выполненного входа в аккаунт Ozon (кнопка на вкладке).")
+
     def _save(self):
-        raw = self.margin_var.get().strip().replace(",", ".")
-        margin_pct = 10.0
-        if raw:
-            try:
-                margin_pct = float(raw)
-            except ValueError:
-                messagebox.showerror("Ошибка", "Наценка должна быть числом.", parent=self)
+        if self.mode_var.get() == "position":
+            query = self.query_var.get().strip()
+            if not query:
+                messagebox.showerror("Ошибка", "Укажите поисковый запрос.", parent=self)
                 return
-        self.result = {"margin_pct": margin_pct, "enabled": self.enabled_var.get()}
+            try:
+                target_position = int(self.target_position_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Ошибка", "Целевая позиция должна быть целым числом.", parent=self)
+                return
+            self.result = {"mode": "position", "query": query, "target_position": target_position,
+                          "enabled": self.enabled_var.get()}
+        else:
+            raw = self.margin_var.get().strip().replace(",", ".")
+            margin_pct = 10.0
+            if raw:
+                try:
+                    margin_pct = float(raw)
+                except ValueError:
+                    messagebox.showerror("Ошибка", "Наценка должна быть числом.", parent=self)
+                    return
+            self.result = {"mode": "margin", "margin_pct": margin_pct, "enabled": self.enabled_var.get()}
         self.destroy()
 
 
@@ -4976,12 +5024,15 @@ class App(tk.Tk):
     def _build_ozon_ads_tab(self, parent: ttk.Frame):
         ttk.Label(parent, text="Автоматическая регулировка ставок по конкурентам",
                  font=("", 10, "bold")).pack(padx=16, pady=(12, 2), anchor="w")
-        hint = ("Каждые 5 минут скрипт сравнивает вашу ставку с конкурентной ставкой по "
-                "товару (Ozon Performance API) и держит вашу ставку выше на заданный процент. "
+        hint = ("Каждые 5 минут скрипт проверяет включённые товары и подстраивает ставку CPC — "
+                "либо держит её выше конкурентной ставки из Ozon Performance API на заданный "
+                "процент, либо (режим «целевая позиция») сверяет текущее место товара в "
+                "«Видимость в поиске» по заданному запросу и шагом ведёт ставку к нужной позиции; "
+                "для этого режима нужен один раз выполненный вход в аккаунт Ozon в браузере. "
                 "Работает только для обычных товарных CPC-кампаний с выключенным автопилотом "
                 "Ozon — для баннерных, «Оплата за заказ» и кампаний с включённым автопилотом "
                 "ручная ставка недоступна или игнорируется.\n"
-                "Дважды кликните по товару, чтобы задать наценку и включить авторегулировку.")
+                "Дважды кликните по товару, чтобы задать способ регулировки и включить его.")
         ttk.Label(parent, text=hint, foreground="gray", wraplength=1000, justify="left").pack(padx=16, anchor="w")
 
         bf = ttk.Frame(parent); bf.pack(padx=16, pady=8, anchor="w")
@@ -4992,13 +5043,15 @@ class App(tk.Tk):
         self.ozon_ads_start_btn.pack(side="left", padx=(16, 4))
         self.ozon_ads_stop_btn = ttk.Button(bf, text="Остановить", command=self._stop_ozon_ads_auto, state="disabled")
         self.ozon_ads_stop_btn.pack(side="left", padx=4)
+        self.ozon_login_btn = ttk.Button(bf, text="Войти в аккаунт Ozon (для позиций)", command=self._ozon_browser_login)
+        self.ozon_login_btn.pack(side="left", padx=(16, 4))
 
         self.ozon_ads_status_label = ttk.Label(parent, text="Нажмите 'Загрузить кампании и товары'", foreground="gray")
         self.ozon_ads_status_label.pack(padx=16, pady=(0, 4), anchor="w")
 
-        cols = ("campaign", "sku", "strategy", "competitive", "margin", "enabled")
-        heads = ("Кампания", "SKU", "Стратегия", "Конкурентная, ₽", "Наценка, %", "Авто")
-        widths = (220, 110, 140, 120, 90, 60)
+        cols = ("campaign", "sku", "strategy", "competitive", "setting", "enabled")
+        heads = ("Кампания", "SKU", "Стратегия", "Конкур.(API), ₽", "Настройка", "Авто")
+        widths = (200, 100, 130, 110, 220, 60)
         tf = ttk.Frame(parent); tf.pack(fill="both", expand=True, padx=16, pady=4)
         vsb = ttk.Scrollbar(tf, orient="vertical")
         tree = ttk.Treeview(tf, columns=cols, show="headings", yscrollcommand=vsb.set, height=12)
@@ -5029,6 +5082,31 @@ class App(tk.Tk):
             self.ozon_ads_log_text.see("end")
             self.ozon_ads_log_text.config(state="disabled")
         self.after(0, _append)
+
+    def _ozon_browser_login(self):
+        if not messagebox.askyesno(
+            "Вход в Ozon",
+            "Откроется окно браузера с личным кабинетом Ozon. Войдите в свой аккаунт как "
+            "обычно (логин, пароль и смс-код вводите сами) — скрипт их не видит и не "
+            "сохраняет, только куки сессии браузера в локальном профиле. После входа просто "
+            "закройте окно браузера. Продолжить?"
+        ):
+            return
+        self.ozon_login_btn.config(state="disabled")
+        self._ozon_ads_log("Открываю окно входа в Ozon...")
+        threading.Thread(target=self._ozon_browser_login_thread, daemon=True).start()
+
+    def _ozon_browser_login_thread(self):
+        try:
+            scraper = OzonVisibilityScraper()
+            ok = scraper.ensure_logged_in()
+            msg = ("Вход выполнен, сессия сохранена." if ok else
+                  "Окно закрыто, но вход не подтверждён — попробуйте ещё раз.")
+            self._ozon_ads_log(msg)
+        except Exception as exc:
+            self._ozon_ads_log(f"Ошибка входа в Ozon: {exc}")
+        finally:
+            self.after(0, lambda: self.ozon_login_btn.config(state="normal"))
 
     def _load_ozon_ads_campaigns(self):
         perf_cfg = self.config_data.get("performance", {})
@@ -5090,13 +5168,17 @@ class App(tk.Tk):
                 is_manual = _ozon_campaign_bid_editable(camp)
                 cfg = products_cfg.get(key, {})
                 enabled = bool(cfg.get("enabled")) and is_manual
-                margin = cfg.get("margin_pct")
                 comp_bid = r["competitive_bid"]
                 strategy_label = "ручная" if is_manual else "автопилот Ozon"
+                if cfg.get("mode") == "position" and cfg.get("query"):
+                    setting_label = f"«{cfg['query']}» → место {cfg.get('target_position', '?')}"
+                else:
+                    margin = cfg.get("margin_pct")
+                    setting_label = f"наценка {margin:.0f}%" if margin else "—"
                 tree.insert("", "end", iid=key, values=(
                     camp.get("title", camp_id), sku, strategy_label,
                     f"{comp_bid:.2f}" if comp_bid is not None else "—",
-                    f"{margin:.0f}" if margin else "—",
+                    setting_label,
                     "Да" if enabled else "Нет",
                 ), tags=("enabled",) if enabled else (("auto",) if not is_manual else ()))
             self.ozon_ads_status_label.config(text=f"Товаров: {len(rows)}", foreground="black")
@@ -5140,9 +5222,10 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno(
             "Подтверждение",
-            "Каждые 5 минут ставка на включённых товарах будет автоматически подстраиваться "
-            "под конкурентную ставку с заданной наценкой. Изменения применяются сразу к живым "
-            "кампаниям, без предварительного подтверждения каждого шага. Запустить?"
+            "Каждые 5 минут ставка на включённых товарах будет автоматически подстраиваться — "
+            "по наценке над конкурентной ставкой или по целевой позиции в поиске, в зависимости "
+            "от настройки товара. Изменения применяются сразу к живым кампаниям, без "
+            "предварительного подтверждения каждого шага. Запустить?"
         ):
             return
         self._ozon_ads_stop_event.clear()
@@ -5160,12 +5243,22 @@ class App(tk.Tk):
     def _ozon_ads_loop(self):
         perf_cfg = self.config_data.get("performance", {})
         perf = OzonPerformanceClient(perf_cfg.get("client_id", ""), perf_cfg.get("client_secret", ""))
+        scraper = OzonVisibilityScraper(headless=True)
         while not self._ozon_ads_stop_event.is_set():
-            products_cfg = self.config_data.get("ozon_ads", {}).get("products", {})
+            ozon_ads_cfg = self.config_data.get("ozon_ads", {})
+            products_cfg = ozon_ads_cfg.get("products", {})
+            step_pct = ozon_ads_cfg.get("step_pct", 10.0)
             try:
                 run_ozon_ads_cycle(perf, products_cfg, log_fn=self._ozon_ads_log)
             except Exception as exc:
                 self._ozon_ads_log(f"ОШИБКА цикла регулировки: {exc}")
+            if any(v.get("mode") == "position" and v.get("enabled") for v in products_cfg.values()):
+                try:
+                    run_ozon_position_cycle(perf, scraper, products_cfg, step_pct,
+                                            save_fn=self._save_ozon_ads_settings,
+                                            log_fn=self._ozon_ads_log)
+                except Exception as exc:
+                    self._ozon_ads_log(f"ОШИБКА цикла регулировки по позиции: {exc}")
             self._ozon_ads_stop_event.wait(300)  # 5 минут, но реагирует на Стоп сразу
 
     def _on_product_dblclick(self, event, marketplace: str, tree: ttk.Treeview):
